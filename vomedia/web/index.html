@@ -8,16 +8,21 @@
 <style>html,body{background:#111217;margin:0}</style>
 <script>const BOOT = /*BOOT*/{};</script>
 <script>
-// подключаем стили и скрипт с токеном
+// подключаем стили и скрипты с токеном; async=false — скрипты выполняются строго по порядку (общие const/let между ними)
 (function () {
   var t = encodeURIComponent(BOOT.token || '');
-  var css = document.createElement('link');
-  css.rel = 'stylesheet';
-  css.href = '/web/app.css?t=' + t;
-  var js = document.createElement('script');
-  js.src = '/web/app.js?t=' + t;
-  js.async = false;
-  document.head.append(css, js);
+  ['app.css', 'grid.css', 'viewer.css'].forEach(function (n) {
+    var css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = '/web/' + n + '?t=' + t;
+    document.head.append(css);
+  });
+  ['core.js', 'grid.js', 'viewer.js', 'ui.js'].forEach(function (n) {
+    var js = document.createElement('script');
+    js.src = '/web/' + n + '?t=' + t;
+    js.async = false;
+    document.head.append(js);
+  });
 })();
 </script>
 </head>

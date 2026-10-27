@@ -15,7 +15,7 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import APP, VERSION
+from . import APP, VERSION, files
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +30,13 @@ CTYPES = {
 
 # статика страницы: только эти файлы (белый список), ничего другого из web/ не отдаётся
 STATIC = {
-    'app.js': 'application/javascript; charset=utf-8',
+    'core.js': 'application/javascript; charset=utf-8',
+    'grid.js': 'application/javascript; charset=utf-8',
+    'viewer.js': 'application/javascript; charset=utf-8',
+    'ui.js': 'application/javascript; charset=utf-8',
     'app.css': 'text/css; charset=utf-8',
+    'grid.css': 'text/css; charset=utf-8',
+    'viewer.css': 'text/css; charset=utf-8',
 }
 
 
@@ -209,6 +214,14 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionError, socket.timeout):
             self.close_connection = True
 
+    def files_route(self, post, p, q, raw):
+        """Файловые действия (проводник, плеер, переименование, удаление, буфер) — целиком в files.py."""
+        try:
+            code, obj = files.route(self.server.ctx, post, p, q, raw)
+        except ValueError as e:
+            raise Fail(str(e), 409)
+        return self.reply(code, obj)
+
     # ───── GET ─────
 
     def route_get(self, p, q):
@@ -219,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if p == ['']:
             return self.page()
+        if files.handles(p):
+            return self.files_route(False, p, q, b'')
         if len(p) == 2 and p[0] == 'web':
             if p[1] not in STATIC:
                 raise Fail('not found', 404)
@@ -333,6 +348,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self, p, raw):
         ctx = self.server.ctx
+        if files.handles(p):
+            return self.files_route(True, p, {}, raw)
         if len(p) == 3 and p[:2] == ['api', 'thumb']:
             fid = file_id(p[2])
             with ctx.use() as lib:
