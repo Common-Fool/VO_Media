@@ -176,14 +176,17 @@ body.viewing #toast{bottom:80px}
 #vfill{width:0;background:var(--accg)}
 #vknob{position:absolute;top:3px;left:0;width:12px;height:12px;margin-left:-6px;border-radius:50%;background:#fff;box-shadow:0 0 0 2px #0006}
 #vseek:hover #vtrack,#vseek:hover #vfill{top:6px;height:6px}
-#vrow{display:flex;align-items:center;gap:6px 18px;flex-wrap:wrap;font-size:13px}
-#vname{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:14px}
+#vrow{position:relative;display:flex;align-items:center;gap:6px 18px;flex-wrap:wrap;font-size:13px}
+/* имя не заезжает под время в центре */
+#vname{flex:1;min-width:120px;max-width:calc(50% - 90px);margin-right:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:14px}
 .vi2{color:#b8bdd0;font-variant-numeric:tabular-nums;white-space:nowrap}
 #vctl{display:flex;align-items:center;gap:10px}
 #vctl button{display:flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0;background:none;border:0;color:#fff}
 #vctl button:hover:not(:disabled){background:#ffffff22}
 #vctl svg{width:20px;height:20px}
-#vtime{min-width:96px;text-align:center;font-variant-numeric:tabular-nums}
+/* время — по центру панели, независимо от длины имени и сведений о файле */
+#vtime{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);min-width:96px;text-align:center;
+  font-variant-numeric:tabular-nums;pointer-events:none}
 #vvol{width:90px}
 #vplay .i-pause,#vplay.playing .i-play{display:none}
 #vplay.playing .i-pause{display:block}
