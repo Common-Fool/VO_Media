@@ -11,6 +11,8 @@ import secrets
 import socket
 import socketserver
 import sys
+import threading
+from collections import OrderedDict
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -21,11 +23,15 @@ log = logging.getLogger(__name__)
 
 MAX_BODY = 5 * 1024 * 1024   # тело POST (раскадровка ≤ 4 МБ, миниатюра ≤ 512 КБ, настройки — мелочь)
 CHUNK = 1024 * 1024          # размер куска при отдаче файла
+PF_HEAD = 2 * 1024 * 1024    # предзагрузка: начало файла
+PF_TAIL = 1024 * 1024        # и конец (moov в конце mp4, Cues в mkv)
+PF_FILES = 8                 # сколько файлов держать в памяти
 
 # тип содержимого по расширению файла библиотеки
 CTYPES = {
     '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp',
     '.gif': 'image/gif', '.mp4': 'video/mp4', '.m4v': 'video/x-m4v',
+    '.mkv': 'video/x-matroska', '.webm': 'video/webm',
 }
 
 # статика страницы: только эти файлы (белый список), ничего другого из web/ не отдаётся
@@ -122,6 +128,124 @@ def parse_range(header, size):
 
 def root_name(root):
     return os.path.basename(root.rstrip('\\/')) or root
+
+
+def qint(s, default, lo, hi):
+    """Целое из параметра запроса, зажатое в [lo, hi]; пусто — default."""
+    if s in ('', None):
+        return default
+    try:
+        v = int(s)
+    except ValueError:
+        raise Fail('bad number: %s' % s)
+    return max(lo, min(hi, v))
+
+
+def jid(v):
+    """id файла из JSON или None."""
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 < v < 1 << 62:
+        return None
+    return v
+
+
+def jnum(v):
+    """Число из JSON (не bool, конечное, ≥ 0) или None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if v != v or v in (float('inf'), float('-inf')) or v < 0:
+        return None
+    return v
+
+
+class Prefetch(object):
+    """Начало (PF_HEAD) и конец (PF_TAIL) нескольких файлов в памяти, чтобы следующее видео стартовало без ожидания NAS.
+
+    Ключ — (корень, id, size, mtime) по кешу библиотеки: при отдаче файла NAS не нужна, чтобы найти кусок.
+    Читает одна фоновая нить; файл, у которого размер или mtime на диске не совпали с кешем, не запоминается.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._items = OrderedDict()     # ключ -> [(смещение, байты)], последний — самый свежий
+        self._queue = OrderedDict()     # ключ -> путь
+        self._thread = None
+
+    def request(self, key, path):
+        with self._lock:
+            if key in self._items:
+                self._items.move_to_end(key)
+                return
+            self._queue[key] = path
+            self._queue.move_to_end(key)
+            while len(self._queue) > PF_FILES:
+                self._queue.popitem(last=False)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._main, name='vomedia-prefetch', daemon=True)
+                self._thread.start()
+            self._cv.notify()
+
+    def chunk(self, key, a):
+        """Кусок (смещение, байты), в котором лежит байт a, или None."""
+        with self._lock:
+            parts = self._items.get(key)
+            if parts is None:
+                return None
+            self._items.move_to_end(key)
+        for off, data in parts:
+            if off <= a < off + len(data):
+                return off, data
+        return None
+
+    def _main(self):
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._cv.wait(60)
+                    if not self._queue:
+                        self._thread = None
+                        return
+                key, path = self._queue.popitem(last=True)      # сначала самый свежий запрос
+            try:
+                parts = self._read(path, key[2], key[3])
+            except OSError as e:
+                log.warning('Prefetch failed: %s: %s', path, e)
+                parts = None
+            if parts:
+                with self._lock:
+                    self._items[key] = parts
+                    self._items.move_to_end(key)
+                    while len(self._items) > PF_FILES:
+                        self._items.popitem(last=False)
+
+    @staticmethod
+    def _read(path, size, mtime):
+        with open(path, 'rb', buffering=0) as f:
+            st = os.fstat(f.fileno())
+            if st.st_size != size or mtime is None or abs(st.st_mtime - mtime) > 0.001 or size <= 0:
+                return None
+            head = _read_n(f, min(size, PF_HEAD))
+            parts = [(0, head)] if head else []
+            if size > len(head):
+                t = max(len(head), size - PF_TAIL)
+                f.seek(t)
+                tail = _read_n(f, size - t)
+                if len(tail) == size - t:
+                    parts.append((t, tail))
+            return parts
+
+
+def _read_n(f, n):
+    """Прочитать n байт (небуферизованный read может вернуть меньше); короче — только у конца файла."""
+    out = []
+    while n > 0:
+        b = f.read(min(n, CHUNK * 4))
+        if not b:
+            break
+        out.append(b)
+        n -= len(b)
+    return b''.join(out)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -271,6 +395,31 @@ class Handler(BaseHTTPRequestHandler):
             if not data:
                 raise Fail('no storyboard', 404)
             return self.reply(200, data, 'image/jpeg', cache='private, max-age=31536000')
+        if p == ['api', 'search']:
+            limit = qint(qv('limit'), 500, 1, 2000)
+            with ctx.use() as lib:
+                lib.touch()
+                return self.reply(200, lib.search(qv('q'), limit))
+        if p == ['api', 'flat']:
+            rel = clean_rel(qv('rel'))
+            sort = qv('sort') if qv('sort') in ('name', 'date', 'size', 'duration') else 'name'
+            filt = qv('filter') if qv('filter') in ('all', 'photo', 'video') else 'all'
+            offset = qint(qv('offset'), 0, 0, 1 << 62)
+            limit = qint(qv('limit'), 5000, 1, 20000)
+            with ctx.use() as lib:
+                lib.touch()
+                d = lib.flat(rel, sort, qv('desc') in ('1', 'true'), filt, offset, limit)
+            if d is None:
+                d = {'rel': rel, 'missing': True, 'total': 0, 'offset': offset, 'files': []}
+            return self.reply(200, d)
+        if p == ['api', 'new']:
+            since = qv('since') or 'last'
+            if since != 'last':
+                since = qint(since, 7, 1, 36500)
+            limit = qint(qv('limit'), 5000, 1, 20000)
+            with ctx.use() as lib:
+                lib.touch()
+                return self.reply(200, lib.new_files(since, limit))
         if p == ['api', 'cache']:
             return self.reply(200, ctx.caches())
         if p == ['api', 'index']:
@@ -306,10 +455,34 @@ class Handler(BaseHTTPRequestHandler):
         with ctx.use() as lib:
             lib.touch()
             row = lib.file_row(fid)
+            root = lib.root
         if not row:
             raise Fail('file not found', 404)
         path = row['path']
         ctype = CTYPES.get(os.path.splitext(path)[1].lower(), 'application/octet-stream')
+        size, mtime = row['size'], row['mtime']
+        hit = None
+        if size and mtime is not None:
+            # предзагруженный кусок: начало ответа — из памяти, без открытия файла на NAS
+            try:
+                rng = parse_range(self.headers.get('Range'), size)
+            except BadRange:
+                rng = False
+            if rng is not False:
+                a = 0 if rng is None else rng[0]
+                c = self.server.prefetch.chunk((root, fid, size, mtime), a)
+                if c is not None:
+                    hit = (rng, c)
+        if hit is not None:
+            rng, (off, data) = hit
+            code, (a, b) = (200, (0, size - 1)) if rng is None else (206, rng)
+            self.file_headers(code, ctype, a, b, size, mtime)
+            end = min(b + 1, off + len(data))
+            self.wfile.write(data[a - off:end - off])
+            if end > b:
+                return
+            with open(path, 'rb', buffering=0) as f:     # остаток за пределами куска — с диска
+                return self.copy_file(f, end, b - end + 1)
         with open(path, 'rb', buffering=0) as f:
             st = os.fstat(f.fileno())
             size = st.st_size
@@ -321,28 +494,35 @@ class Handler(BaseHTTPRequestHandler):
                 code, a, b = 200, 0, size - 1
             else:
                 code, (a, b) = 206, rng
-            n = max(0, b - a + 1)
-            self.send_response(code)
-            self.send_header('Content-Type', ctype)
-            self.send_header('Content-Length', str(n))
-            self.send_header('Accept-Ranges', 'bytes')
-            self.send_header('Last-Modified', formatdate(st.st_mtime, usegmt=True))
-            self.send_header('Cache-Control', 'private, max-age=300')
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            if code == 206:
-                self.send_header('Content-Range', 'bytes %d-%d/%d' % (a, b, size))
-            self.end_headers()
-            self.started = True
-            if n and a:
-                f.seek(a)
-            left = n
-            while left > 0:
-                chunk = f.read(min(CHUNK, left))
-                if not chunk:  # файл стал короче, чем обещано: Content-Length уже не выполнить
-                    self.close_connection = True
-                    break
-                self.wfile.write(chunk)
-                left -= len(chunk)
+            self.file_headers(code, ctype, a, b, size, st.st_mtime)
+            self.copy_file(f, a, max(0, b - a + 1))
+
+    def file_headers(self, code, ctype, a, b, size, mtime):
+        """Заголовки ответа с файлом библиотеки (после них ошибку уже не отправить)."""
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(max(0, b - a + 1)))
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Last-Modified', formatdate(mtime, usegmt=True))
+        self.send_header('Cache-Control', 'private, max-age=300')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        if code == 206:
+            self.send_header('Content-Range', 'bytes %d-%d/%d' % (a, b, size))
+        self.end_headers()
+        self.started = True
+
+    def copy_file(self, f, a, n):
+        """n байт файла с позиции a в ответ кусками по CHUNK."""
+        if n and a:
+            f.seek(a)
+        left = n
+        while left > 0:
+            chunk = f.read(min(CHUNK, left))
+            if not chunk:  # файл стал короче, чем обещано: Content-Length уже не выполнить
+                self.close_connection = True
+                break
+            self.wfile.write(chunk)
+            left -= len(chunk)
 
     # ───── POST ─────
 
@@ -363,6 +543,28 @@ class Handler(BaseHTTPRequestHandler):
                 ok = lib.put_story(fid, raw)
             if not ok:
                 raise Fail('storyboard rejected')
+            return self.reply(200, {'ok': True})
+        if p == ['api', 'progress']:
+            b = self.jbody(raw)
+            fid = jid(b.get('id'))
+            pos, dur = jnum(b.get('pos')), jnum(b.get('dur'))
+            if fid is None or pos is None:
+                raise Fail('bad progress')
+            with ctx.use() as lib:
+                if not lib.save_progress(fid, pos, dur):
+                    raise Fail('file not found', 404)
+            return self.reply(200, {'ok': True})
+        if p == ['api', 'prefetch']:
+            fid = jid(self.jbody(raw).get('id'))
+            if fid is None:
+                raise Fail('bad id')
+            with ctx.use() as lib:
+                row = lib.file_row(fid)
+                root = lib.root
+            if not row:
+                raise Fail('file not found', 404)
+            if row['size'] and row['mtime'] is not None:
+                self.server.prefetch.request((root, fid, row['size'], row['mtime']), row['path'])
             return self.reply(200, {'ok': True})
         if p == ['api', 'index', 'start']:
             full = bool(self.jbody(raw).get('full'))
@@ -445,4 +647,5 @@ def make_server(port, ctx):
         log.warning('Port %d is busy, using a free one.', port)
         srv = Server(('127.0.0.1', 0), Handler)
     srv.ctx = ctx
+    srv.prefetch = Prefetch()
     return srv
