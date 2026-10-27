@@ -16,6 +16,17 @@ Python 3.8+, только стандартная библиотека; `pywebvie
 - Не пытаться воспроизводить Windows, SMB, WebView2 в песочнице: это проверяет владелец.
 - Среда владельца: Windows 10/11, RTX 5080, библиотека на Synology по SMB (больше 1 млн файлов; мелкие запросы по сети дорогие).
 
+## Планы (просил владелец, не сделано)
+
+- Открыть папку / показать файл в проводнике (как `show_in_explorer()` в VSPO: `explorer /select,`, macOS `open -R`, Linux `xdg-open`).
+- Контекстное меню по правому клику на плитке и в просмотрщике: открыть, открыть во внешнем плеере (выбор плеера как в VSPO: `play()`,
+  `list_players()`), показать в проводнике, переименовать, копировать (файл в буфер обмена для вставки в проводнике и/или путь),
+  удалить — **обычное удаление** (владелец: без `_to_delete` и Ctrl+Z, «для остального есть корзина» — корзина Synology `#recycle`
+  на общей папке / корзина Windows на локальных дисках). С подтверждением своим диалогом `ask()`. Это отменяет «только просмотр» v1.
+- Превью «с условиями» (листы кадров как в VSPO для тысяч видео) — обсудить отдельно.
+- Другие форматы видео (mkv, ts) — перепаковка ffmpeg на лету, по желанию.
+- Сборка на GitHub Actions, релизы, самообновление (как в VSPO).
+
 ## Грабли (из VSPO, не повторять)
 
 1. `SO_REUSEADDR` в Windows → два экземпляра на одном порту: только `SO_EXCLUSIVEADDRUSE`.
@@ -30,10 +41,11 @@ Python 3.8+, только стандартная библиотека; `pywebvie
 ## Сборка exe (только с разрешения владельца)
 
 ```
-python -m PyInstaller --noconfirm --onefile --noconsole --name "VO Media" --add-data "vomedia/web;vomedia/web" --collect-all webview --collect-all pythonnet --collect-all clr_loader vomedia.py
+python -m PyInstaller --noconfirm --onefile --noconsole --name "VO Media" --add-data "vomedia/web;vomedia/web" --collect-all webview --collect-all pythonnet --collect-all clr_loader --icon assets/vomedia.ico vomedia.py
 ```
 
-Результат — `dist\VO Media.exe` (~23 МБ). Страница берётся из `sys._MEIPASS/vomedia/web` (`server.web_dir()`). Иконки пока нет.
+Результат — `dist\VO Media.exe` (~23 МБ). Страница берётся из `sys._MEIPASS/vomedia/web` (`server.web_dir()`).
+Иконка — `assets/vomedia.ico` (рисует `assets/make_icon.py`, нужен Pillow; во вкладке страницы — такой же SVG в `<link rel="icon">`).
 Workflow GitHub Actions пока нет — сборка вручную.
 
 ## Как проверять (только с разрешения владельца)

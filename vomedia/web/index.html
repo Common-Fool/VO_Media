@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VO Media</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%231eaaff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='3' y='3' width='58' height='58' rx='14' fill='url(%23g)'/%3E%3Crect x='15' y='19' width='34' height='26' rx='5' fill='%23fff'/%3E%3Cpath d='M28 26v12l10-6z' fill='%235476ff'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%231eaaff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='2.56' y='2.56' width='58.88' height='58.88' rx='14.08' fill='url(%23g)'/%3E%3Crect x='10.88' y='14.08' width='37.76' height='29.44' rx='4.48' fill='%23fff'/%3E%3Cpath d='M14.66 39.4L25.23 24.68L34.29 39.4zM26.74 39.4L35.05 29.39L44.86 39.4z' fill='%235476ff'/%3E%3Ccircle cx='39.58' cy='22.91' r='3.24' fill='%235476ff'/%3E%3Ccircle cx='44.8' cy='44.8' r='12.16' fill='%23fff'/%3E%3Ccircle cx='44.8' cy='44.8' r='9.73' fill='%235476ff'/%3E%3Cpath d='M41.9 40.13V49.47L49.47 44.8z' fill='%23fff'/%3E%3C/svg%3E">
 <style>html,body{background:#111217;margin:0}</style>
 <script>const BOOT = /*BOOT*/{};</script>
 <script>
@@ -62,6 +62,7 @@
   <button id="mupd">Update library</button>
   <button id="mfull">Full rescan</button>
   <button id="mkeys">Keyboard shortcuts</button>
+  <button id="mcache">Cache…</button>
   <hr>
   <div id="mver" class="ver"></div>
 </div>
@@ -90,7 +91,9 @@
     <button id="vnext" class="vnav" tabindex="-1" title="Next (→)">›</button>
     <button id="vclose" tabindex="-1" title="Close (Esc)">✕</button>
   </div>
+  <div id="vpv" hidden><canvas id="vpvc" width="1" height="1"></canvas><span id="vpvt"></span></div>
   <div id="vbar">
+    <div id="vtl" hidden title="Timeline: click a frame to jump there"><canvas id="vtlc"></canvas><div id="vtlm"></div><div id="vtlt" hidden></div></div>
     <div id="vseek" hidden><div id="vtrack"></div><div id="vfill"></div><div id="vknob"></div></div>
     <div id="vrow">
       <span id="vname"></span>
@@ -102,12 +105,18 @@
         <span id="vtime">0:00 / 0:00</span>
         <button id="vmute" tabindex="-1" title="Mute (M)"><svg class="i-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M15.5 9a4 4 0 010 6M18 6.5a8 8 0 010 11"/></svg><svg class="i-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
         <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume">
+        <button id="vtlb" tabindex="-1" title="Timeline (T)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M9 6v12M15 6v12"/></svg></button>
       </span>
     </div>
   </div>
 </div>
 
 <div id="ov" hidden>
+  <div class="sheet" id="cachep" hidden>
+    <h2>Cache</h2>
+    <div id="cachec" class="cbox">Loading…</div>
+    <div class="acts"><button id="cclose" class="go">Close</button></div>
+  </div>
   <div class="sheet" id="keyp" hidden>
     <h2>Keyboard shortcuts</h2>
     <div class="keys">
@@ -120,17 +129,20 @@
       <span><kbd>[</kbd> <kbd>]</kbd></span><span>Previous / next folder of the same level</span>
       <span><kbd>F5</kbd></span><span>Reread the current folder from disk</span>
       <h3>Viewer</h3>
-      <span><kbd>←</kbd> <kbd>→</kbd></span><span>Previous / next file</span>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>Previous / next file (past the last or first file: the next / previous folder)</span>
       <span><kbd>Home</kbd> <kbd>End</kbd></span><span>First / last file</span>
       <span><kbd>Space</kbd></span><span>Play / pause a video</span>
       <span><kbd>Enter</kbd></span><span>Full screen on / off</span>
-      <span><kbd>Ctrl</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 5 s</span>
-      <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 30 s</span>
+      <span><kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 5 s</span>
+      <span><kbd>Ctrl</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 30 s</span>
+      <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 2 min</span>
+      <span><kbd>T</kbd></span><span>Timeline with video frames on / off</span>
       <span><kbd>↑</kbd> <kbd>↓</kbd></span><span>Volume</span>
       <span><kbd>M</kbd></span><span>Mute</span>
       <span><kbd>I</kbd></span><span>Show / hide the bottom bar</span>
       <span><kbd>Esc</kbd></span><span>Leave full screen, otherwise close the viewer</span>
       <span>Mouse wheel</span><span>Next / previous file</span>
+      <span>Click on the picture</span><span>Close the viewer (in full screen: play / pause a video)</span>
       <span>Double click</span><span>Full screen on / off</span>
     </div>
     <div class="acts"><button id="kclose" class="go">Close</button></div>

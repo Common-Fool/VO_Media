@@ -5,6 +5,9 @@
 import argparse
 import contextlib
 import json
+import re
+import shutil
+import sqlite3
 import logging
 import os
 import secrets
@@ -14,13 +17,15 @@ import time
 import webbrowser
 
 from . import APP, VERSION
-from .index import Library, app_dir
+from .index import Library, app_dir, cache_dir
 from .server import make_server, root_name
 
 log = logging.getLogger(__name__)
 
 HAS_CONSOLE = [True]   # False при запуске без консоли (pythonw): вывод идёт в журнал, ошибки — окном сообщения
 RECENT_MAX = 10
+CACHE_LIMIT_GB = 20      # лимит места миниатюр и раскадровок на библиотеку по умолчанию
+CACHE_DAYS = 90          # кеш библиотеки, которую не открывали столько дней, удаляется при запуске
 SLOCK = threading.Lock()   # файл settings.json
 
 
@@ -99,6 +104,53 @@ def root_key(root):
     return os.path.normcase(os.path.abspath(root))
 
 
+def read_cache_info(d):
+    """Корень, место и время последнего открытия кеша библиотеки (без открытия Library)."""
+    info = {'root': '', 'bytes': 0, 'opened': None}
+    db = os.path.join(d, 'library.sqlite')
+    try:
+        c = sqlite3.connect('file:%s?mode=ro' % db.replace('\\', '/'), uri=True, timeout=2)
+        try:
+            kv = dict(c.execute("SELECT k, v FROM meta_kv WHERE k IN ('root', 'bytes', 'opened')").fetchall())
+        finally:
+            c.close()
+        info['root'] = kv.get('root', '')
+        info['bytes'] = int(float(kv.get('bytes') or 0))
+        info['opened'] = float(kv['opened']) if kv.get('opened') else None
+    except (sqlite3.Error, ValueError):
+        pass
+    if not info['opened']:
+        try:
+            info['opened'] = os.path.getmtime(db)
+        except OSError:
+            pass
+    if not info['bytes']:
+        try:
+            info['bytes'] = os.path.getsize(db)
+        except OSError:
+            pass
+    return info
+
+
+def cleanup_old_caches(current):
+    """Удалить кеши библиотек, которые не открывали CACHE_DAYS дней (фоном при запуске)."""
+    base = os.path.join(app_dir(), 'cache')
+    cur = os.path.normcase(cache_dir(current))
+    edge = time.time() - CACHE_DAYS * 86400
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    for name in names:
+        d = os.path.join(base, name)
+        if os.path.normcase(d) == cur or not re.fullmatch(r'[0-9a-f]{16}', name):
+            continue
+        info = read_cache_info(d)
+        if info['opened'] and info['opened'] < edge:
+            shutil.rmtree(d, ignore_errors=True)
+            log.info('Old cache removed (not opened for %d days): %s', CACHE_DAYS, info['root'] or name)
+
+
 # ───────────────────────── диалог выбора папки ─────────────────────────
 
 def pick_folder(initial=''):
@@ -153,7 +205,7 @@ class App:
         self._swlock = threading.Lock()   # одна смена папки за раз
         self._plock = threading.Lock()    # один диалог выбора папки за раз
         path = os.path.abspath(folder)
-        self._lib = Library(path)
+        self._lib = self._open(path)
         self._root = path
         self._remember(path)
         self._lib.start_index(False)      # пустую БД Library сама обходит полностью; окно обхода не ждёт
@@ -188,6 +240,99 @@ class App:
             self._lib.close()
         except Exception:  # noqa: BLE001
             log.exception('closing the library failed')
+
+    def _open(self, path):
+        lib = Library(path)
+        lib.cache_limit = self.cache_limit()
+        return lib
+
+    # ───── кеш ─────
+
+    def cache_limit(self):
+        """Лимит места миниатюр и раскадровок в байтах (0 — без лимита)."""
+        v = read_all().get('cache_limit_gb', CACHE_LIMIT_GB)
+        try:
+            return max(0, int(float(v) * 1024 ** 3))
+        except (TypeError, ValueError):
+            return CACHE_LIMIT_GB * 1024 ** 3
+
+    def set_cache_limit(self, gb):
+        gb = float(gb)
+        if gb < 0 or gb > 100000:
+            raise ValueError('Bad cache limit')
+        with SLOCK:
+            d = read_all()
+            d['cache_limit_gb'] = gb
+            try:
+                write_all(d)
+            except OSError as e:
+                log.warning('Could not save settings: %s', e)
+        with self.use() as lib:
+            lib.cache_limit = self.cache_limit()
+            lib.check_limit()
+
+    def caches(self):
+        """Кеши всех библиотек: текущая (подробно) и остальные (корень, место, когда открывали)."""
+        with self.use() as lib:
+            cur = lib.cache_stats()
+            cur_dir = os.path.normcase(lib.cache)
+        others = []
+        base = os.path.join(app_dir(), 'cache')
+        try:
+            names = os.listdir(base)
+        except OSError:
+            names = []
+        for name in names:
+            d = os.path.join(base, name)
+            if os.path.normcase(d) == cur_dir or not re.fullmatch(r'[0-9a-f]{16}', name):
+                continue
+            info = read_cache_info(d)
+            info['key'] = name
+            others.append(info)
+        others.sort(key=lambda x: -(x.get('opened') or 0))
+        return {'current': cur, 'others': others, 'limit_gb': self.cache_limit() / 1024 ** 3}
+
+    def remove_cache(self, key):
+        """Удалить кеш другой (не открытой) библиотеки."""
+        if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{16}', key):
+            raise ValueError('Bad cache id')
+        d = os.path.join(app_dir(), 'cache', key)
+        with self.use() as lib:
+            if os.path.normcase(d) == os.path.normcase(lib.cache):
+                raise ValueError('This is the cache of the open folder')
+        shutil.rmtree(d, ignore_errors=True)
+        log.info('Cache removed: %s', key)
+
+    def clear_thumbs(self):
+        with self.use() as lib:
+            lib.clear_thumbs()
+
+    def reset_cache(self):
+        """Удалить весь кеш открытой папки (индекс, миниатюры) и начать полный обход заново."""
+        if not self._swlock.acquire(False):
+            raise ValueError('Another folder is being opened')
+        try:
+            with self._cv:
+                self._switching = True
+                ok = self._cv.wait_for(lambda: self._active == 0, timeout=60)
+                if not ok:
+                    self._switching = False
+                    self._cv.notify_all()
+            if not ok:
+                raise ValueError('The folder is busy, try again in a moment')
+            try:
+                old = self._lib
+                old.close()
+                shutil.rmtree(old.cache, ignore_errors=True)
+                self._lib = self._open(self._root)
+            finally:
+                with self._cv:
+                    self._switching = False
+                    self._cv.notify_all()
+        finally:
+            self._swlock.release()
+        log.info('Library cache reset: %s', self._root)
+        self._lib.start_index(True)
 
     # ───── настройки ─────
 
@@ -264,7 +409,7 @@ class App:
             raise ValueError('Another folder is being opened')
         try:
             try:
-                new = Library(path)  # открываем до замены: не вышло — старая остаётся как есть
+                new = self._open(path)  # открываем до замены: не вышло — старая остаётся как есть
             except Exception as e:  # noqa: BLE001
                 log.exception('could not open the library for %s', path)
                 raise ValueError('Could not open %s: %s' % (path, e))
@@ -388,6 +533,7 @@ def main():
     except OSError as e:
         app.close()
         die('Could not start the local server: %s' % e)
+    threading.Thread(target=cleanup_old_caches, args=(path,), name='vomedia-cleanup', daemon=True).start()
     url = 'http://127.0.0.1:%d/?t=%s' % (srv.server_address[1], app.token)
     log.info('Viewer: %s', url)
     try:

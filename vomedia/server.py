@@ -19,7 +19,7 @@ from . import APP, VERSION
 
 log = logging.getLogger(__name__)
 
-MAX_BODY = 4 * 1024 * 1024   # тело POST (миниатюра ≤ 512 КБ, настройки — мелочь)
+MAX_BODY = 5 * 1024 * 1024   # тело POST (раскадровка ≤ 4 МБ, миниатюра ≤ 512 КБ, настройки — мелочь)
 CHUNK = 1024 * 1024          # размер куска при отдаче файла
 
 # тип содержимого по расширению файла библиотеки
@@ -243,6 +243,21 @@ class Handler(BaseHTTPRequestHandler):
             with ctx.use() as lib:
                 dirs = lib.subdirs(rel)
             return self.reply(200, {'rel': rel, 'dirs': dirs or []})
+        if p == ['api', 'neighbor']:
+            rel = clean_rel(qv('rel'))
+            step = -1 if qv('step') == '-1' else 1
+            with ctx.use() as lib:
+                lib.touch()
+                return self.reply(200, {'rel': lib.neighbor_dir(rel, step)})
+        if len(p) == 2 and p[0] == 's':
+            fid = file_id(p[1])
+            with ctx.use() as lib:
+                data = lib.get_story(fid)
+            if not data:
+                raise Fail('no storyboard', 404)
+            return self.reply(200, data, 'image/jpeg', cache='private, max-age=31536000')
+        if p == ['api', 'cache']:
+            return self.reply(200, ctx.caches())
         if p == ['api', 'index']:
             with ctx.use() as lib:
                 return self.reply(200, lib.index_status())
@@ -325,6 +340,13 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 raise Fail('thumbnail rejected')
             return self.reply(200, {'ok': True})
+        if len(p) == 3 and p[:2] == ['api', 'story']:
+            fid = file_id(p[2])
+            with ctx.use() as lib:
+                ok = lib.put_story(fid, raw)
+            if not ok:
+                raise Fail('storyboard rejected')
+            return self.reply(200, {'ok': True})
         if p == ['api', 'index', 'start']:
             full = bool(self.jbody(raw).get('full'))
             with ctx.use() as lib:
@@ -334,6 +356,22 @@ class Handler(BaseHTTPRequestHandler):
             with ctx.use() as lib:
                 lib.stop_index()
                 return self.reply(200, lib.index_status())
+        if p[:2] == ['api', 'cache'] and len(p) == 3:
+            b = self.jbody(raw)
+            try:
+                if p[2] == 'limit':
+                    ctx.set_cache_limit(b.get('gb'))
+                elif p[2] == 'clear':
+                    ctx.clear_thumbs()
+                elif p[2] == 'reset':
+                    ctx.reset_cache()
+                elif p[2] == 'remove':
+                    ctx.remove_cache(b.get('key'))
+                else:
+                    raise Fail('not found', 404)
+            except (ValueError, TypeError) as e:
+                raise Fail(str(e), 409)
+            return self.reply(200, ctx.caches())
         if p == ['api', 'settings']:
             ctx.save_settings(self.jbody(raw))
             return self.reply(200, {'ok': True})

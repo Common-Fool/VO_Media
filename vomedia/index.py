@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -25,6 +26,9 @@ YIELD = 1.5                     # на сколько секунд фоновы�
 META_BATCH = 200                # файлов за выборку для нити метаданных
 META_FLUSH = 25                 # сколько результатов копить до записи
 MAX_THUMB = 512 * 1024
+MAX_STORY = 4 * 1024 * 1024        # раскадровка видео (спрайт 6×5 кадров)
+THUMB_PX = '800'                # размер миниатюр; сменился — старые сбрасываются
+JANITOR_EVERY = 600             # как часто (с) проверять лимит места кеша
 MAX_ERRORS = 30                 # подряд ошибок папок — считаем, что NAS недоступна
 SKIP_NAMES = frozenset({'system volume information', '_to_delete', '_на_удаление'})
 KIND_PHOTO, KIND_VIDEO = 1, 2
@@ -136,6 +140,11 @@ def long_path(p):
     return '\\\\?\\' + p
 
 
+def _nat(s):
+    """Ключ естественной сортировки имён: 'img2' < 'img10'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
 def _root_name(root):
     return os.path.basename(root.rstrip('/\\')) or root
 
@@ -148,6 +157,7 @@ class Library(object):
         self.root_name = _root_name(self.root)
         self.cache = cache_dir(self.root)
         self.thumbs_dir = os.path.join(self.cache, 'thumbs')
+        self.story_dir = os.path.join(self.cache, 'story')
         os.makedirs(self.thumbs_dir, exist_ok=True)
         self.db_path = os.path.join(self.cache, 'library.sqlite')
 
@@ -159,7 +169,6 @@ class Library(object):
         self._touched = time.monotonic() - 10 * YIELD
         self._prio = []                     # последние prioritize(): rel
         self._plock = threading.Lock()
-        self._noexif = set()                # id, у которых EXIF-миниатюры нет (не читать NAS повторно)
 
         # обход
         self._ixlock = threading.Lock()
@@ -171,11 +180,18 @@ class Library(object):
         # метаданные
         self._meta_event = threading.Event()
         self._meta_thread = None
+        # место кеша: байты миниатюр и раскадровок (считает нить janitor, дальше — на ходу)
+        self.cache_limit = 0                # байт; 0 — без лимита (задаёт app.py)
+        self._bytes = {'thumbs': 0, 'story': 0, 'n_thumbs': 0, 'n_story': 0, 'ready': False}
+        self._blk = threading.Lock()
+        self._jan_event = threading.Event()
 
         self._init_db()
         self._meta_event.set()
         self._meta_thread = threading.Thread(target=self._meta_main, name='vomedia-meta', daemon=True)
         self._meta_thread.start()
+        self._jan_thread = threading.Thread(target=self._janitor, name='vomedia-cache', daemon=True)
+        self._jan_thread.start()
 
     # ─── соединения и транзакции ───
 
@@ -233,10 +249,20 @@ class Library(object):
                 shutil.rmtree(self.thumbs_dir, ignore_errors=True)
                 os.makedirs(self.thumbs_dir, exist_ok=True)
             c.executescript(DDL)
+            if 'seen' not in [r[1] for r in c.execute('PRAGMA table_info(dirs)')]:
+                c.execute('ALTER TABLE dirs ADD COLUMN seen REAL')     # когда папку последний раз открывали
+            c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('opened', ?)", (str(time.time()),))
             c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('schema', ?)", (SCHEMA,))
             c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('root', ?)", (self.root,))
             c.execute("INSERT OR IGNORE INTO dirs(id, parent, rel, name) VALUES(1, NULL, '', ?)", (self.root_name,))
             c.execute("UPDATE dirs SET name=? WHERE id=1", (self.root_name,))
+            r = c.execute("SELECT v FROM meta_kv WHERE k='thumb_px'").fetchone()
+            if not r or r[0] != THUMB_PX:       # миниатюры другого размера: сбросить, страница сделает новые
+                c.execute('UPDATE files SET thumb=0 WHERE thumb=1')
+                shutil.rmtree(self.thumbs_dir, ignore_errors=True)
+                shutil.rmtree(self.story_dir, ignore_errors=True)
+                os.makedirs(self.thumbs_dir, exist_ok=True)
+                c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('thumb_px', ?)", (THUMB_PX,))
 
     def _kv_get(self, k):
         r = self._db().execute('SELECT v FROM meta_kv WHERE k=?', (k,)).fetchone()
@@ -249,8 +275,9 @@ class Library(object):
         self._closed = True
         self._stop_ix.set()
         self._meta_event.set()
+        self._jan_event.set()
         me = threading.current_thread()
-        for t in (self._ix, self._meta_thread):
+        for t in (self._ix, self._meta_thread, self._jan_thread):
             if t is not None and t is not me and t.is_alive():
                 t.join(5)
         with self._clock:
@@ -275,12 +302,28 @@ class Library(object):
     def thumb_file(self, fid):
         return os.path.join(self.thumbs_dir, '%02x' % (fid % 256), '%d.jpg' % fid)
 
+    def story_file(self, fid):
+        return os.path.join(self.story_dir, '%02x' % (fid % 256), '%d.jpg' % fid)
+
+    def _count(self, kind, d_bytes, d_n):
+        with self._blk:
+            self._bytes[kind] += d_bytes
+            self._bytes['n_' + kind] += d_n
+
+    def _remove(self, kind, path):
+        """Удалить файл кеша и поправить счётчик места."""
+        try:
+            n = os.path.getsize(path)
+            os.remove(path)
+        except OSError:
+            return
+        self._count(kind, -n, -1)
+
     def _unlink_thumbs(self, ids):
+        """Удалить миниатюры и раскадровки файлов (изменились или исчезли)."""
         for fid in ids:
-            try:
-                os.remove(self.thumb_file(fid))
-            except OSError:
-                pass
+            self._remove('thumbs', self.thumb_file(fid))
+            self._remove('story', self.story_file(fid))
 
     # ─── чтение для страницы (только кеш) ───
 
@@ -425,13 +468,11 @@ class Library(object):
                 ins.append((did, name, kind, size, mt))
             elif o[1] != kind or o[2] != size or o[3] is None or abs(o[3] - mt) > 0.001:
                 upd.append((kind, size, mt, o[0]))
-                if o[4] == 1:
-                    unlink.append(o[0])
+                unlink.append(o[0])
         gone = []
         for o in old.values():
             gone.append((o[0],))
-            if o[4] == 1:
-                unlink.append(o[0])
+            unlink.append(o[0])
         if ins:
             c.executemany('INSERT INTO files(dir, name, kind, size, mtime) VALUES(?, ?, ?, ?, ?)', ins)
         if upd:
@@ -483,6 +524,8 @@ class Library(object):
         with self._tx() as c:
             did = self._ensure(c, rel)
             res = self._apply(c, did, dmtime, subs, files) if did else None
+            if did:
+                c.execute('UPDATE dirs SET seen=? WHERE id=?', (time.time(), did))   # для вытеснения кеша
         if res is None:
             return False
         changed, unlink, new_files = res
@@ -770,31 +813,205 @@ class Library(object):
             c.execute('UPDATE files SET thumb=? WHERE id=?', (value, fid))
 
     def get_thumb(self, fid):
-        """Миниатюра из кеша; для JPEG без неё — встроенная EXIF (сохраняется). Иначе None."""
-        row = self._db().execute('SELECT f.name, f.kind, f.thumb, d.rel FROM files f '
-                                 'JOIN dirs d ON d.id=f.dir WHERE f.id=?', (fid,)).fetchone()
-        if row is None:
+        """Миниатюра из кеша или None (EXIF-миниатюры ~160 px — для 800 px малы, делает страница)."""
+        r = self._db().execute('SELECT thumb FROM files WHERE id=?', (fid,)).fetchone()
+        if not r or r[0] != 1:
             return None
-        name, kind, th, rel = row
-        if th == 1:
+        try:
+            with open(self.thumb_file(fid), 'rb') as f:
+                return f.read()
+        except OSError:                         # файл миниатюры потерян
+            self._set_thumb(fid, 0)
+            return None
+
+    def _put_file(self, kind, path, data):
+        """Записать файл кеша через .part + os.replace. False — не вышло."""
+        tmp = '%s.%d.part' % (path, threading.get_ident())
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, 'wb') as f:
+                f.write(data)
             try:
-                with open(self.thumb_file(fid), 'rb') as f:
-                    return f.read()
-            except OSError:                     # файл миниатюры потерян
-                self._set_thumb(fid, 0)
-                th = 0
-        if th == 0 and kind == KIND_PHOTO and fid not in self._noexif \
-                and name.lower().endswith(('.jpg', '.jpeg')):
-            data = None
+                old = os.path.getsize(path)
+            except OSError:
+                old = -1
+            os.replace(tmp, path)
+            self._count(kind, len(data) - max(old, 0), 0 if old >= 0 else 1)
+            return True
+        except OSError as e:
+            log.warning('Cannot save %s: %s', path, e)
             try:
-                data = meta.exif_thumb(self._abs(rel, name))
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def get_story(self, fid):
+        """Раскадровка видео из кеша или None."""
+        try:
+            with open(self.story_file(fid), 'rb') as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def put_story(self, fid, data):
+        """Сохранить раскадровку (JPEG ≤ 4 МБ) только для видео, которое есть в кеше."""
+        if not data or len(data) > MAX_STORY or bytes(data[:2]) != b'\xff\xd8':
+            return False
+        r = self._db().execute('SELECT kind FROM files WHERE id=?', (fid,)).fetchone()
+        if not r or r[0] != KIND_VIDEO:
+            return False
+        return self._put_file('story', self.story_file(fid), data)
+
+    # ─── место кеша ───
+
+    def _scan_bytes(self):
+        """Посчитать место миниатюр и раскадровок обходом локальной папки кеша."""
+        tot = {'thumbs': 0, 'story': 0, 'n_thumbs': 0, 'n_story': 0}
+        for kind, base in (('thumbs', self.thumbs_dir), ('story', self.story_dir)):
+            try:
+                subs = list(os.scandir(base))
+            except OSError:
+                continue
+            for d in subs:
+                if self._closed:
+                    return
+                try:
+                    with os.scandir(d.path) as it:
+                        for e in it:
+                            if e.name.endswith('.jpg'):
+                                tot[kind] += e.stat().st_size
+                                tot['n_' + kind] += 1
+                except OSError:
+                    pass
+        with self._blk:
+            self._bytes.update(tot, ready=True)
+
+    def cache_stats(self):
+        """Место кеша этой библиотеки: миниатюры, раскадровки, БД, лимит."""
+        with self._blk:
+            st = dict(self._bytes)
+        db = 0
+        for sfx in ('', '-wal', '-shm'):
+            try:
+                db += os.path.getsize(self.db_path + sfx)
+            except OSError:
+                pass
+        st.update(db=db, limit=self.cache_limit, root=self.root)
+        return st
+
+    def _evict(self, target):
+        """Удалять миниатюры и раскадровки давно не открытых папок, пока место не станет ≤ target."""
+        c = self._db()
+        with self._plock:
+            keep = set(self._prio)              # недавно открытые папки не трогаем
+        rows = c.execute('SELECT d.id, d.rel FROM dirs d WHERE EXISTS(SELECT 1 FROM files f '
+                         'WHERE f.dir=d.id AND (f.thumb=1 OR f.kind=?)) '
+                         'ORDER BY d.seen IS NOT NULL, d.seen', (KIND_VIDEO,)).fetchall()
+        freed = 0
+        for did, rel in rows:
+            with self._blk:
+                used = self._bytes['thumbs'] + self._bytes['story']
+            if used <= target or self._closed:
+                break
+            if rel in keep:
+                continue
+            ids = [r[0] for r in c.execute('SELECT id FROM files WHERE dir=? AND (thumb=1 OR kind=?)',
+                                           (did, KIND_VIDEO))]
+            with self._tx() as w:
+                w.execute('UPDATE files SET thumb=0 WHERE dir=? AND thumb=1', (did,))
+            self._unlink_thumbs(ids)
+            freed += 1
+        if freed:
+            log.info('Cache limit: thumbnails of %d least recently opened folders removed', freed)
+
+    def _janitor(self):
+        """Нить места кеша: подсчёт при запуске, потом раз в JANITOR_EVERY — лимит."""
+        if self._jan_event.wait(5) and self._closed:
+            return
+        try:
+            self._scan_bytes()
+        except Exception:
+            log.exception('Cache size scan failed')
+        while not self._closed:
+            try:
+                st = self.cache_stats()
+                if self.cache_limit and st['thumbs'] + st['story'] > self.cache_limit:
+                    self._evict(int(self.cache_limit * 0.9))
+                with self._tx() as c:
+                    c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('bytes', ?)",
+                              (str(st['thumbs'] + st['story'] + st['db']),))
             except Exception:
-                data = None
-            if data and self.put_thumb(fid, data):
-                return bytes(data)
-            if len(self._noexif) > 200000:
-                self._noexif.clear()
-            self._noexif.add(fid)
+                if self._closed:
+                    break
+                log.exception('Cache janitor error')
+            self._jan_event.wait(JANITOR_EVERY)
+            self._jan_event.clear()
+
+    def check_limit(self):
+        """Проверить лимит сейчас (после смены лимита)."""
+        self._jan_event.set()
+
+    def clear_thumbs(self):
+        """Удалить все миниатюры и раскадровки этой библиотеки (индекс остаётся)."""
+        with self._tx() as c:
+            c.execute('UPDATE files SET thumb=0 WHERE thumb=1')
+        for d in (self.thumbs_dir, self.story_dir):
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(self.thumbs_dir, exist_ok=True)
+        with self._blk:
+            self._bytes.update(thumbs=0, story=0, n_thumbs=0, n_story=0)
+        log.info('Thumbnails cleared: %s', self.root)
+
+    # ─── соседняя папка (переход в просмотрщике) ───
+
+    @staticmethod
+    def _node(c, did):
+        return c.execute('SELECT id, parent, rel, name, own_photo + own_video FROM dirs WHERE id=?', (did,)).fetchone()
+
+    @staticmethod
+    def _kids(c, did):
+        rows = c.execute('SELECT id, parent, rel, name, own_photo + own_video FROM dirs WHERE parent=?', (did,)).fetchall()
+        rows.sort(key=lambda r: _nat(r[3]))
+        return rows
+
+    def _pre_next(self, c, n):
+        """Следующая папка в порядке дерева (обход в глубину)."""
+        k = self._kids(c, n[0])
+        if k:
+            return k[0]
+        while n is not None and n[1] is not None:
+            sib = self._kids(c, n[1])
+            i = [x[0] for x in sib].index(n[0])
+            if i + 1 < len(sib):
+                return sib[i + 1]
+            n = self._node(c, n[1])
+        return None
+
+    def _pre_prev(self, c, n):
+        """Предыдущая папка в порядке дерева."""
+        if n[1] is None:
+            return None
+        sib = self._kids(c, n[1])
+        i = [x[0] for x in sib].index(n[0])
+        if i == 0:
+            return self._node(c, n[1])
+        n = sib[i - 1]
+        while True:                             # самая последняя папка поддерева предыдущего соседа
+            k = self._kids(c, n[0])
+            if not k:
+                return n
+            n = k[-1]
+
+    def neighbor_dir(self, rel, step):
+        """rel ближайшей папки со своими файлами после (step > 0) или до (step < 0) данной; None — нет."""
+        c = self._db()
+        n = c.execute('SELECT id, parent, rel, name, own_photo + own_video FROM dirs WHERE rel=?',
+                      (self._norm(rel),)).fetchone()
+        while n is not None:
+            n = self._pre_next(c, n) if step > 0 else self._pre_prev(c, n)
+            if n is not None and n[4] > 0:
+                return n[2]
         return None
 
     def put_thumb(self, fid, data):
@@ -803,19 +1020,7 @@ class Library(object):
             return False
         if self._db().execute('SELECT 1 FROM files WHERE id=?', (fid,)).fetchone() is None:
             return False
-        path = self.thumb_file(fid)
-        tmp = '%s.%d.part' % (path, threading.get_ident())
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(tmp, 'wb') as f:
-                f.write(data)
-            os.replace(tmp, path)
-        except OSError as e:
-            log.warning('Cannot save thumbnail %s: %s', fid, e)
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
+        if not self._put_file('thumbs', self.thumb_file(fid), data):
             return False
         with self._tx() as c:
             n = c.execute('UPDATE files SET thumb=1 WHERE id=?', (fid,)).rowcount
