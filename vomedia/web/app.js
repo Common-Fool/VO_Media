@@ -485,7 +485,12 @@ function canvasBlob(src, w, h) {
   const x = c.getContext('2d');
   x.imageSmoothingQuality = 'high';
   x.drawImage(src, 0, 0, cw, ch);
-  return new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('toBlob')), 'image/jpeg', 0.82));
+  // toDataURL, а не toBlob: Chromium откладывает toBlob/convertToBlob на простой потока — замерено ~0,9 с
+  // на миниатюру против ~20 мс у toDataURL
+  const s = atob(c.toDataURL('image/jpeg', 0.82).split(',')[1]);
+  const a = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i);
+  return Promise.resolve(new Blob([a], {type: 'image/jpeg'}));
 }
 
 async function makePhotoThumb(f, t) {

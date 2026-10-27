@@ -23,6 +23,18 @@ Python 3.8+, только стандартная библиотека; `pywebvie
 3. Системные `confirm()`/`alert()` в окне pywebview не гарантированы — свои диалоги.
 4. Тело POST читать всегда (keep-alive).
 5. Обходить NAS в обработчике запроса нельзя (кроме одной папки в `refresh_dir`): по SMB это секунды-минуты.
+6. `canvas.toBlob` / `OffscreenCanvas.convertToBlob` для миниатюр → Chromium откладывает кодирование на простой потока, замерено ~0,9 с
+   на штуку. Только `toDataURL` (~20 мс), см. `canvasBlob()` в `app.js`.
+7. Пути длиннее 260 знаков в Windows без префикса `\\?\` дают `FileNotFoundError` — кеш принял бы папку за удалённую. Все пути к NAS — через `Library._abs()` (`long_path()`).
+
+## Сборка exe (только с разрешения владельца)
+
+```
+python -m PyInstaller --noconfirm --onefile --noconsole --name "VO Media" --add-data "vomedia/web;vomedia/web" --collect-all webview --collect-all pythonnet --collect-all clr_loader vomedia.py
+```
+
+Результат — `dist\VO Media.exe` (~23 МБ). Страница берётся из `sys._MEIPASS/vomedia/web` (`server.web_dir()`). Иконки пока нет.
+Workflow GitHub Actions пока нет — сборка вручную.
 
 ## Как проверять (только с разрешения владельца)
 
