@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build
+build/
+dist/
+*.spec
+
+# Local environment and logs
+.venv/
+*.log
+*.part
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VO Media</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%237c5cff'/%3E%3Cstop offset='1' stop-color='%231eaaff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='3' y='3' width='58' height='58' rx='14' fill='url(%23g)'/%3E%3Crect x='15' y='19' width='34' height='26' rx='5' fill='%23fff'/%3E%3Cpath d='M28 26v12l10-6z' fill='%235476ff'/%3E%3C/svg%3E">
+<style>html,body{background:#111217;margin:0}</style>
+<script>const BOOT = /*BOOT*/{};</script>
+<script>
+// подключаем стили и скрипт с токеном
+(function () {
+  var t = encodeURIComponent(BOOT.token || '');
+  var css = document.createElement('link');
+  css.rel = 'stylesheet';
+  css.href = '/web/app.css?t=' + t;
+  var js = document.createElement('script');
+  js.src = '/web/app.js?t=' + t;
+  js.async = false;
+  document.head.append(css, js);
+})();
+</script>
+</head>
+<body>
+<header id="hd">
+  <span id="logo"><svg viewBox="0 0 64 64" aria-hidden="true"><defs><linearGradient id="lg" x2="0" y2="1"><stop offset="0" stop-color="#7c5cff"/><stop offset="1" stop-color="#1eaaff"/></linearGradient></defs><rect x="3" y="3" width="58" height="58" rx="14" fill="url(#lg)"/><rect x="15" y="19" width="34" height="26" rx="5" fill="#fff"/><path d="M28 26v12l10-6z" fill="#5476ff"/></svg>VO Media</span>
+  <button id="rootb" title="Open another folder"><span id="rootn"></span> ▾</button>
+  <button id="tg" class="ib" title="Show or hide the folder tree"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h6M4 12h6M4 19h6M10 5v14M10 12h4M10 19h4M14 5h6"/></svg></button>
+  <label title="Sort order">Sort
+    <select id="srt" aria-label="Sort order">
+      <option value="name">Name</option>
+      <option value="date">Date</option>
+      <option value="size">Size</option>
+      <option value="duration">Duration</option>
+    </select>
+    <button id="sdir" title="Ascending / descending">↑</button>
+  </label>
+  <select id="flt" aria-label="Filter" title="Filter files">
+    <option value="all">All</option>
+    <option value="photo">Photos</option>
+    <option value="video">Videos</option>
+  </select>
+  <label title="Tile size"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg><input id="sz" type="range" min="120" max="480" step="10" aria-label="Tile size"></label>
+  <div id="vw" class="seg" title="How folders are shown">
+    <button data-v="tiles">Tiles</button><button data-v="list">List</button>
+  </div>
+  <div id="idx" class="sp"><span id="idxt" class="dim"></span><button id="idxs" hidden title="Stop indexing">Stop</button></div>
+  <button id="menub" class="ib" title="Menu"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+</header>
+<div id="sub">
+  <nav id="crumbs" aria-label="Path"></nav>
+  <span id="busy" class="dim" hidden>Refreshing…</span>
+  <span id="cnt" class="dim"></span>
+</div>
+
+<div id="rootp" hidden>
+  <div class="ph2">Recent folders</div>
+  <div id="rootl"></div>
+  <div class="acts"><button id="rpick" class="go">Open folder…</button></div>
+</div>
+<div id="menup" hidden>
+  <button id="mupd">Update library</button>
+  <button id="mfull">Full rescan</button>
+  <button id="mkeys">Keyboard shortcuts</button>
+  <hr>
+  <div id="mver" class="ver"></div>
+</div>
+
+<div id="wrap">
+  <aside id="tree"><nav id="dirs"></nav></aside>
+  <div id="split" title="Drag to resize"></div>
+  <main id="main">
+    <div id="scroll">
+      <div id="lhead" hidden>
+        <span data-s="name">Name</span><span class="num">Photos</span><span class="num">Videos</span><span class="num" data-s="size">Size</span><span class="num" data-s="date">Modified</span>
+      </div>
+      <div id="sizer"><div id="cells"></div></div>
+    </div>
+    <div id="msg" hidden></div>
+  </main>
+</div>
+
+<div id="v" hidden>
+  <div id="vstage">
+    <img id="vi" alt="" draggable="false">
+    <video id="vv" playsinline preload="none" disablepictureinpicture hidden></video>
+    <div id="vspin" hidden></div>
+    <div id="vmsg" hidden></div>
+    <button id="vprev" class="vnav" tabindex="-1" title="Previous (←)">‹</button>
+    <button id="vnext" class="vnav" tabindex="-1" title="Next (→)">›</button>
+    <button id="vclose" tabindex="-1" title="Close (Esc)">✕</button>
+  </div>
+  <div id="vbar">
+    <div id="vseek" hidden><div id="vtrack"></div><div id="vfill"></div><div id="vknob"></div></div>
+    <div id="vrow">
+      <span id="vname"></span>
+      <span id="vpos" class="vi2"></span>
+      <span id="vsize" class="vi2"></span>
+      <span id="vres" class="vi2"></span>
+      <span id="vctl" hidden>
+        <button id="vplay" tabindex="-1" title="Play / pause (Space)"><svg class="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.5v13l11-6.5z"/></svg><svg class="i-pause" viewBox="0 0 24 24" fill="currentColor"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg></button>
+        <span id="vtime">0:00 / 0:00</span>
+        <button id="vmute" tabindex="-1" title="Mute (M)"><svg class="i-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M15.5 9a4 4 0 010 6M18 6.5a8 8 0 010 11"/></svg><svg class="i-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z" fill="currentColor"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg></button>
+        <input id="vvol" type="range" min="0" max="1" step="0.01" aria-label="Volume">
+      </span>
+    </div>
+  </div>
+</div>
+
+<div id="ov" hidden>
+  <div class="sheet" id="keyp" hidden>
+    <h2>Keyboard shortcuts</h2>
+    <div class="keys">
+      <h3>Folder view</h3>
+      <span><kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd></span><span>Select a tile (folders and files in one order)</span>
+      <span><kbd>Home</kbd> <kbd>End</kbd></span><span>First / last tile</span>
+      <span><kbd>PgUp</kbd> <kbd>PgDn</kbd></span><span>Page up / down</span>
+      <span><kbd>Enter</kbd> <kbd>Space</kbd></span><span>Open: enter a folder or view a file</span>
+      <span><kbd>Backspace</kbd> <kbd>Alt</kbd>+<kbd>↑</kbd></span><span>Up one level</span>
+      <span><kbd>[</kbd> <kbd>]</kbd></span><span>Previous / next folder of the same level</span>
+      <span><kbd>F5</kbd></span><span>Reread the current folder from disk</span>
+      <h3>Viewer</h3>
+      <span><kbd>←</kbd> <kbd>→</kbd></span><span>Previous / next file</span>
+      <span><kbd>Home</kbd> <kbd>End</kbd></span><span>First / last file</span>
+      <span><kbd>Space</kbd></span><span>Play / pause a video</span>
+      <span><kbd>Enter</kbd></span><span>Full screen on / off</span>
+      <span><kbd>Ctrl</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 5 s</span>
+      <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 30 s</span>
+      <span><kbd>↑</kbd> <kbd>↓</kbd></span><span>Volume</span>
+      <span><kbd>M</kbd></span><span>Mute</span>
+      <span><kbd>I</kbd></span><span>Show / hide the bottom bar</span>
+      <span><kbd>Esc</kbd></span><span>Leave full screen, otherwise close the viewer</span>
+      <span>Mouse wheel</span><span>Next / previous file</span>
+      <span>Double click</span><span>Full screen on / off</span>
+    </div>
+    <div class="acts"><button id="kclose" class="go">Close</button></div>
+  </div>
+</div>
+
+<div id="dlg" hidden>
+  <div class="box">
+    <p id="dtxt"></p>
+    <div class="acts"><button id="dno">Cancel</button><button id="dok" class="go">Continue</button></div>
+  </div>
+</div>
+<div id="toast"></div>
+</body>
+</html>

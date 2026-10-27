@@ -1,0 +1,825 @@
+"""Кеш библиотеки в SQLite: обход NAS, агрегаты по папкам, фоновые нити, миниатюры.
+
+Страница обслуживается только из кеша; NAS читают лишь refresh_dir (одна папка)
+и фоновые нити, которые уступают пользователю (touch()).
+"""
+import contextlib
+import hashlib
+import logging
+import os
+import shutil
+import sqlite3
+import sys
+import threading
+import time
+from collections import deque
+
+from . import meta
+
+log = logging.getLogger('vomedia')
+
+IS_WIN = sys.platform == 'win32'
+REPARSE = 0x400                 # FILE_ATTRIBUTE_REPARSE_POINT (junction, symlink)
+SCHEMA = '1'
+YIELD = 1.5                     # на сколько секунд фоновые нити уступают после touch()
+META_BATCH = 200                # файлов за выборку для нити метаданных
+META_FLUSH = 25                 # сколько результатов копить до записи
+MAX_THUMB = 512 * 1024
+MAX_ERRORS = 30                 # подряд ошибок папок — считаем, что NAS недоступна
+SKIP_NAMES = frozenset({'system volume information', '_to_delete', '_на_удаление'})
+KIND_PHOTO, KIND_VIDEO = 1, 2
+
+DDL = """
+CREATE TABLE IF NOT EXISTS meta_kv(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS dirs(
+  id INTEGER PRIMARY KEY, parent INTEGER,
+  rel TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL, mtime REAL,
+  listed REAL,
+  own_photo INTEGER DEFAULT 0, own_video INTEGER DEFAULT 0, own_size INTEGER DEFAULT 0,
+  n_photo INTEGER DEFAULT 0, n_video INTEGER DEFAULT 0, size INTEGER DEFAULT 0,
+  n_dirs INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS dirs_parent ON dirs(parent);
+CREATE TABLE IF NOT EXISTS files(
+  id INTEGER PRIMARY KEY, dir INTEGER NOT NULL, name TEXT NOT NULL,
+  kind INTEGER NOT NULL,
+  size INTEGER, mtime REAL,
+  w INTEGER, h INTEGER, duration REAL, rot INTEGER,
+  meta INTEGER DEFAULT 0,
+  thumb INTEGER DEFAULT 0,
+  UNIQUE(dir, name));
+CREATE INDEX IF NOT EXISTS files_meta ON files(meta) WHERE meta = 0;
+CREATE INDEX IF NOT EXISTS files_thumb ON files(dir) WHERE thumb = 1;
+"""
+
+
+# ─── где лежит кеш ───
+
+def app_dir():
+    """Папка данных программы (создаётся при первом обращении)."""
+    p = os.environ.get('VOMEDIA_HOME')
+    if not p:
+        if IS_WIN:
+            p = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'VO Media')
+        elif sys.platform == 'darwin':
+            p = os.path.expanduser('~/Library/Application Support/VO Media')
+        else:
+            base = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+            p = os.path.join(base, 'vo-media')
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def cache_dir(root):
+    """Папка кеша для данной библиотеки: <app_dir>/cache/<sha1 пути>."""
+    key = os.path.normcase(os.path.abspath(root))
+    h = hashlib.sha1(key.encode('utf-8', 'replace')).hexdigest()[:16]
+    return os.path.join(app_dir(), 'cache', h)
+
+
+# ─── разбор папки ───
+
+def skip_dir(name):
+    """Папки, которые обход не трогает (служебные, корзины)."""
+    return name[:1] in ('.', '@', '#', '$') or name.lower() in SKIP_NAMES
+
+
+def _is_reparse(entry):
+    """Junction/точка повторной обработки в Windows (symlink отсекает is_dir(follow_symlinks=False))."""
+    if not IS_WIN:
+        return False
+    try:
+        return bool(entry.stat(follow_symlinks=False).st_file_attributes & REPARSE)
+    except (OSError, AttributeError):
+        return False
+
+
+def _encodable(name):
+    try:
+        name.encode('utf-8')
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def list_folder(path):
+    """Прочитать одну папку: (имена подпапок, {имя: (kind, size, mtime)}). На Windows stat файлов берётся из списка."""
+    subs = []
+    files = {}
+    with os.scandir(path) as it:
+        for e in it:
+            name = e.name
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if not skip_dir(name) and _encodable(name) and not _is_reparse(e):
+                        subs.append(name)
+                    continue
+                if name[:1] == '.':
+                    continue
+                k = meta.kind_of(name)
+                if k is None or not _encodable(name) or not e.is_file():
+                    continue
+                st = e.stat()
+                files[name] = (KIND_PHOTO if k == 'photo' else KIND_VIDEO, st.st_size, st.st_mtime)
+            except OSError:
+                continue
+    return subs, files
+
+
+def long_path(p):
+    """Windows: путь длиннее MAX_PATH — с префиксом \\\\?\\ (иначе FileNotFoundError, хотя файл есть)."""
+    if not IS_WIN or len(p) < 240 or p.startswith('\\\\?\\'):
+        return p
+    p = os.path.normpath(p)             # префикс \\?\ не понимает '/' и '..'
+    if p.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + p[2:]
+    return '\\\\?\\' + p
+
+
+def _root_name(root):
+    return os.path.basename(root.rstrip('/\\')) or root
+
+
+class Library(object):
+    """Кеш одной открытой папки. Потокобезопасен: соединение на нить, запись под wlock."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.root_name = _root_name(self.root)
+        self.cache = cache_dir(self.root)
+        self.thumbs_dir = os.path.join(self.cache, 'thumbs')
+        os.makedirs(self.thumbs_dir, exist_ok=True)
+        self.db_path = os.path.join(self.cache, 'library.sqlite')
+
+        self.wlock = threading.RLock()
+        self._local = threading.local()
+        self._conns = {}                    # ident нити -> соединение (для close() и чистки)
+        self._clock = threading.Lock()
+        self._closed = False
+        self._touched = time.monotonic() - 10 * YIELD
+        self._prio = []                     # последние prioritize(): rel
+        self._plock = threading.Lock()
+        self._noexif = set()                # id, у которых EXIF-миниатюры нет (не читать NAS повторно)
+
+        # обход
+        self._ixlock = threading.Lock()
+        self._ix = None
+        self._ix_running = False
+        self._stop_ix = threading.Event()
+        self._st = {'full': False, 'dirs': 0, 'listed': 0, 'current': '',
+                    'started': None, 'finished': None, 'error': ''}
+        # метаданные
+        self._meta_event = threading.Event()
+        self._meta_thread = None
+
+        self._init_db()
+        self._meta_event.set()
+        self._meta_thread = threading.Thread(target=self._meta_main, name='vomedia-meta', daemon=True)
+        self._meta_thread.start()
+
+    # ─── соединения и транзакции ───
+
+    def _connect(self):
+        c = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False, isolation_level=None)
+        c.execute('PRAGMA synchronous=NORMAL')
+        c.execute('PRAGMA cache_size=-20000')
+        return c
+
+    def _db(self):
+        """Соединение текущей нити (создаётся при первом обращении)."""
+        c = getattr(self._local, 'c', None)
+        if c is None:
+            if self._closed:
+                raise sqlite3.ProgrammingError('library is closed')
+            c = self._connect()
+            self._local.c = c
+            with self._clock:
+                self._conns[threading.get_ident()] = c
+                if len(self._conns) > 16:       # нити HTTP умирают: закрываем их соединения
+                    alive = set(t.ident for t in threading.enumerate())
+                    for ident in list(self._conns):
+                        if ident not in alive:
+                            try:
+                                self._conns.pop(ident).close()
+                            except Exception:
+                                pass
+        return c
+
+    @contextlib.contextmanager
+    def _tx(self):
+        """Короткая транзакция записи под wlock (не вкладывать)."""
+        with self.wlock:
+            c = self._db()
+            c.execute('BEGIN IMMEDIATE')
+            try:
+                yield c
+                c.execute('COMMIT')
+            except BaseException:
+                try:
+                    c.execute('ROLLBACK')
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def _init_db(self):
+        with self.wlock:
+            c = self._db()
+            c.execute('PRAGMA journal_mode=WAL')
+            c.execute('CREATE TABLE IF NOT EXISTS meta_kv(k TEXT PRIMARY KEY, v TEXT)')
+            r = c.execute("SELECT v FROM meta_kv WHERE k='schema'").fetchone()
+            if r and r[0] != SCHEMA:
+                log.warning('Cache schema %s != %s, rebuilding', r[0], SCHEMA)
+                c.executescript('DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS dirs; DELETE FROM meta_kv;')
+                shutil.rmtree(self.thumbs_dir, ignore_errors=True)
+                os.makedirs(self.thumbs_dir, exist_ok=True)
+            c.executescript(DDL)
+            c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('schema', ?)", (SCHEMA,))
+            c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('root', ?)", (self.root,))
+            c.execute("INSERT OR IGNORE INTO dirs(id, parent, rel, name) VALUES(1, NULL, '', ?)", (self.root_name,))
+            c.execute("UPDATE dirs SET name=? WHERE id=1", (self.root_name,))
+
+    def _kv_get(self, k):
+        r = self._db().execute('SELECT v FROM meta_kv WHERE k=?', (k,)).fetchone()
+        return r[0] if r else None
+
+    def close(self):
+        """Остановить нити и закрыть соединения."""
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_ix.set()
+        self._meta_event.set()
+        me = threading.current_thread()
+        for t in (self._ix, self._meta_thread):
+            if t is not None and t is not me and t.is_alive():
+                t.join(5)
+        with self._clock:
+            conns = list(self._conns.values())
+            self._conns.clear()
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    # ─── пути ───
+
+    @staticmethod
+    def _norm(rel):
+        return (rel or '').strip('/')
+
+    def _abs(self, rel, name=None):
+        p = os.path.join(self.root, *rel.split('/')) if rel else self.root
+        return long_path(os.path.join(p, name) if name else p)
+
+    def thumb_file(self, fid):
+        return os.path.join(self.thumbs_dir, '%02x' % (fid % 256), '%d.jpg' % fid)
+
+    def _unlink_thumbs(self, ids):
+        for fid in ids:
+            try:
+                os.remove(self.thumb_file(fid))
+            except OSError:
+                pass
+
+    # ─── чтение для страницы (только кеш) ───
+
+    def _dir_thumbs(self, c, did, rel, total):
+        """До 4 id миниатюр: из самой папки, добор из поддерева (диапазон по rel, без LIKE)."""
+        if not total:
+            return []
+        ids = [[r[0], r[1]] for r in c.execute('SELECT id, mtime FROM files WHERE dir=? AND thumb=1 LIMIT 4', (did,))]
+        if len(ids) < 4:
+            for r in c.execute('SELECT f.id, f.mtime FROM dirs d CROSS JOIN files f ON f.dir=d.id '
+                               'WHERE d.rel>=? AND d.rel<? AND f.thumb=1 LIMIT ?',
+                               (rel + '/', rel + '0', 4 - len(ids))):
+                ids.append([r[0], r[1]])
+        return ids
+
+    def _dir_items(self, c, did):
+        out = []
+        rows = c.execute('SELECT id, rel, name, n_photo, n_video, size, n_dirs, mtime, listed '
+                         'FROM dirs WHERE parent=? ORDER BY name', (did,)).fetchall()
+        for sid, rel, name, n_p, n_v, size, n_d, mt, li in rows:
+            out.append({'rel': rel, 'name': name, 'n_photo': n_p, 'n_video': n_v, 'size': size,
+                        'n_dirs': n_d, 'mtime': mt, 'listed': li,
+                        'thumbs': self._dir_thumbs(c, sid, rel, n_p + n_v)})
+        return out
+
+    def list_dir(self, rel):
+        rel = self._norm(rel)
+        c = self._db()
+        r = c.execute('SELECT id, name, mtime, listed FROM dirs WHERE rel=?', (rel,)).fetchone()
+        if r is None:
+            return None
+        did, name, mtime, listed = r
+        parts = rel.split('/') if rel else []
+        parents = []
+        if parts:
+            parents.append({'rel': '', 'name': self.root_name})
+            for i in range(1, len(parts)):
+                parents.append({'rel': '/'.join(parts[:i]), 'name': parts[i - 1]})
+        files = []
+        for fid, fname, kind, size, mt, w, h, dur, th in c.execute(
+                'SELECT id, name, kind, size, mtime, w, h, duration, thumb FROM files WHERE dir=? ORDER BY name',
+                (did,)):
+            files.append({'id': fid, 'name': fname, 'kind': 'photo' if kind == KIND_PHOTO else 'video',
+                          'size': size, 'mtime': mt, 'w': w, 'h': h, 'duration': dur, 'thumb': th})
+        return {'rel': rel, 'name': name, 'listed': listed, 'mtime': mtime, 'parents': parents,
+                'dirs': self._dir_items(c, did), 'files': files}
+
+    def subdirs(self, rel):
+        rel = self._norm(rel)
+        c = self._db()
+        r = c.execute('SELECT id FROM dirs WHERE rel=?', (rel,)).fetchone()
+        if r is None:
+            return None
+        return self._dir_items(c, r[0])
+
+    def file_path(self, fid):
+        r = self._db().execute('SELECT d.rel, f.name FROM files f JOIN dirs d ON d.id=f.dir WHERE f.id=?',
+                               (fid,)).fetchone()
+        if r is None:
+            return None
+        return self._abs(r[0], r[1])
+
+    def file_row(self, fid):
+        r = self._db().execute('SELECT d.rel, f.name, f.kind, f.size, f.mtime FROM files f '
+                               'JOIN dirs d ON d.id=f.dir WHERE f.id=?', (fid,)).fetchone()
+        if r is None:
+            return None
+        return {'id': fid, 'name': r[1], 'kind': 'photo' if r[2] == KIND_PHOTO else 'video',
+                'size': r[3], 'mtime': r[4], 'path': self._abs(r[0], r[1])}
+
+    # ─── слияние списка папки с кешем ───
+
+    def _bump(self, c, did, d_p, d_v, d_s):
+        """Прибавить разницу итогов к папке и всем её предкам."""
+        if not (d_p or d_v or d_s):
+            return
+        while did is not None:
+            c.execute('UPDATE dirs SET n_photo=n_photo+?, n_video=n_video+?, size=size+? WHERE id=?',
+                      (d_p, d_v, d_s, did))
+            r = c.execute('SELECT parent FROM dirs WHERE id=?', (did,)).fetchone()
+            did = r[0] if r else None
+
+    def _drop_subtree(self, c, did, rel):
+        """Удалить папку и всё поддерево (rel с префиксом 'rel/' — диапазон по индексу, без LIKE).
+        Вернуть id файлов, у которых были миниатюры."""
+        args = (rel, rel + '/', rel + '0')
+        tids = [r[0] for r in c.execute(
+            'SELECT f.id FROM dirs d CROSS JOIN files f ON f.dir=d.id '
+            'WHERE f.thumb=1 AND (d.rel=? OR (d.rel>=? AND d.rel<?))', args)]
+        c.execute('DELETE FROM files WHERE dir IN (SELECT id FROM dirs WHERE rel=? OR (rel>=? AND rel<?))', args)
+        c.execute('DELETE FROM dirs WHERE rel=? OR (rel>=? AND rel<?)', args)
+        return tids
+
+    def _ensure(self, c, rel):
+        """id папки; если её нет в кеше — добавить цепочку предков (listed=NULL). None — путь в пропускаемых."""
+        r = c.execute('SELECT id FROM dirs WHERE rel=?', (rel,)).fetchone()
+        if r:
+            return r[0]
+        pid = 1
+        cur = ''
+        for p in rel.split('/'):
+            cur = cur + '/' + p if cur else p
+            r = c.execute('SELECT id FROM dirs WHERE rel=?', (cur,)).fetchone()
+            if r:
+                pid = r[0]
+                continue
+            if skip_dir(p):
+                return None
+            pid = self._add_dir(c, pid, cur, p)
+        return pid
+
+    def _add_dir(self, c, parent, rel, name):
+        cur = c.execute('INSERT INTO dirs(parent, rel, name) VALUES(?, ?, ?)', (parent, rel, name))
+        c.execute('UPDATE dirs SET n_dirs=n_dirs+1 WHERE id=?', (parent,))
+        return cur.lastrowid
+
+    def _apply(self, c, did, dmtime, subs, files):
+        """Слить прочитанный список папки с кешем (внутри транзакции).
+        Вернуть (изменилось, id файлов для удаления миниатюр, есть новые/изменённые файлы) или None, если папки уже нет."""
+        row = c.execute('SELECT rel, own_photo, own_video, own_size, listed FROM dirs WHERE id=?', (did,)).fetchone()
+        if row is None:
+            return None
+        rel, o_p, o_v, o_s, listed = row
+        changed = listed is None
+        unlink = []
+
+        # файлы: сопоставление по имени, id сохраняются
+        old = {}
+        for fid, name, kind, size, mt, th in c.execute(
+                'SELECT id, name, kind, size, mtime, thumb FROM files WHERE dir=?', (did,)):
+            old[name] = (fid, kind, size, mt, th)
+        ins, upd = [], []
+        n_p = n_v = total = 0
+        for name, (kind, size, mt) in files.items():
+            if kind == KIND_PHOTO:
+                n_p += 1
+            else:
+                n_v += 1
+            total += size
+            o = old.pop(name, None)
+            if o is None:
+                ins.append((did, name, kind, size, mt))
+            elif o[1] != kind or o[2] != size or o[3] is None or abs(o[3] - mt) > 0.001:
+                upd.append((kind, size, mt, o[0]))
+                if o[4] == 1:
+                    unlink.append(o[0])
+        gone = []
+        for o in old.values():
+            gone.append((o[0],))
+            if o[4] == 1:
+                unlink.append(o[0])
+        if ins:
+            c.executemany('INSERT INTO files(dir, name, kind, size, mtime) VALUES(?, ?, ?, ?, ?)', ins)
+        if upd:
+            c.executemany('UPDATE files SET kind=?, size=?, mtime=?, w=NULL, h=NULL, duration=NULL, rot=NULL, '
+                          'meta=0, thumb=0 WHERE id=?', upd)
+        if gone:
+            c.executemany('DELETE FROM files WHERE id=?', gone)
+        if ins or upd or gone:
+            changed = True
+
+        # подпапки
+        d_p, d_v, d_s = n_p - o_p, n_v - o_v, total - o_s
+        olds = {}
+        for sid, name, srel, sp, sv, ss in c.execute(
+                'SELECT id, name, rel, n_photo, n_video, size FROM dirs WHERE parent=?', (did,)):
+            olds[name] = (sid, srel, sp, sv, ss)
+        present = set(subs)
+        for name, (sid, srel, sp, sv, ss) in olds.items():
+            if name not in present:
+                unlink.extend(self._drop_subtree(c, sid, srel))
+                d_p -= sp
+                d_v -= sv
+                d_s -= ss
+                changed = True
+        for name in subs:
+            if name not in olds:
+                self._add_dir(c, did, rel + '/' + name if rel else name, name)
+                changed = True
+        # n_dirs задаём явно (после _add_dir, который прибавляет +1 для ensure-цепочек)
+        c.execute('UPDATE dirs SET mtime=?, listed=?, own_photo=?, own_video=?, own_size=?, n_dirs=? WHERE id=?',
+                  (dmtime, time.time(), n_p, n_v, total, len(subs), did))
+        self._bump(c, did, d_p, d_v, d_s)
+        return changed, unlink, bool(ins or upd)
+
+    def refresh_dir(self, rel):
+        """Перечитать одну папку с диска и слить с кешем. True — что-то изменилось."""
+        rel = self._norm(rel)
+        if rel and any(skip_dir(p) for p in rel.split('/')):
+            return False
+        path = self._abs(rel)
+        try:
+            dmtime = os.stat(path).st_mtime
+            subs, files = list_folder(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return self._vanished(rel)
+        except OSError as e:
+            log.warning('Cannot read %s: %s', path, e)
+            return False
+        with self._tx() as c:
+            did = self._ensure(c, rel)
+            res = self._apply(c, did, dmtime, subs, files) if did else None
+        if res is None:
+            return False
+        changed, unlink, new_files = res
+        self._unlink_thumbs(unlink)
+        if new_files:
+            self._meta_event.set()
+        return changed
+
+    def _vanished(self, rel):
+        """Папки нет на диске: убрать из кеша. Только если корень доступен (NAS не оффлайн)."""
+        if not rel or not os.path.isdir(self.root):
+            return False
+        parts = rel.split('/')
+        top = None
+        for i in range(1, len(parts) + 1):      # самый верхний пропавший предок
+            sub = '/'.join(parts[:i])
+            if not os.path.isdir(self._abs(sub)):
+                top = sub
+                break
+        if top is None:
+            return False
+        with self._tx() as c:
+            r = c.execute('SELECT id, parent, n_photo, n_video, size FROM dirs WHERE rel=?', (top,)).fetchone()
+            if r is None:
+                return False
+            unlink = self._drop_subtree(c, r[0], top)
+            self._bump(c, r[1], -r[2], -r[3], -r[4])
+            c.execute('UPDATE dirs SET n_dirs=MAX(n_dirs-1, 0) WHERE id=?', (r[1],))
+        self._unlink_thumbs(unlink)
+        log.info('Folder removed from cache: %s', top)
+        return True
+
+    def recompute_totals(self):
+        """Пересчитать n_photo/n_video/size/n_dirs снизу вверх из own_* (страховка от расхождений)."""
+        with self._tx() as c:
+            rows = c.execute('SELECT id, parent, rel, own_photo, own_video, own_size, '
+                             'n_photo, n_video, size, n_dirs FROM dirs').fetchall()
+            tot = {}
+            for r in rows:
+                tot[r[0]] = [r[3], r[4], r[5], 0]
+            rows.sort(key=lambda r: (r[2].count('/') + 1) if r[2] else 0, reverse=True)
+            for r in rows:
+                par = r[1]
+                if par is not None and par in tot:
+                    t, pt = tot[r[0]], tot[par]
+                    pt[0] += t[0]
+                    pt[1] += t[1]
+                    pt[2] += t[2]
+                    pt[3] += 1
+            upd = []
+            for r in rows:
+                t = tot[r[0]]
+                if (t[0], t[1], t[2], t[3]) != (r[6], r[7], r[8], r[9]):
+                    upd.append((t[0], t[1], t[2], t[3], r[0]))
+            if upd:
+                c.executemany('UPDATE dirs SET n_photo=?, n_video=?, size=?, n_dirs=? WHERE id=?', upd)
+        if upd:
+            log.info('Totals corrected for %d folders', len(upd))
+
+    # ─── уступчивость пользователю ───
+
+    def touch(self):
+        self._touched = time.monotonic()
+
+    def _pause(self, stop=None):
+        """Спать, пока пользователь активен (touch() был меньше YIELD секунд назад)."""
+        while not self._closed and not (stop is not None and stop.is_set()):
+            d = self._touched + YIELD - time.monotonic()
+            if d <= 0:
+                return
+            time.sleep(min(d, 0.25))
+
+    def prioritize(self, rel):
+        rel = self._norm(rel)
+        with self._plock:
+            if rel in self._prio:
+                self._prio.remove(rel)
+            self._prio.append(rel)
+            del self._prio[:-3]
+        self._meta_event.set()
+
+    # ─── фоновый обход ───
+
+    def start_index(self, full=False):
+        t = None
+        with self._ixlock:
+            if self._closed:
+                return
+            if self._ix_running:
+                # идёт обычный обход, а просят полный, или обход уже останавливается — перезапустить
+                if not (self._stop_ix.is_set() or (full and not self._st['full'])):
+                    return
+                self._stop_ix.set()
+                t = self._ix
+        if t is not None and t is not threading.current_thread():
+            t.join(10)
+        with self._ixlock:
+            if self._closed or self._ix_running:
+                return
+            if not self._kv_get('full_done'):
+                full = True                     # первый обход пустой БД — полный
+            self._stop_ix.clear()
+            self._st.update(full=bool(full), dirs=0, listed=0, current='', started=time.time(),
+                            finished=None, error='')
+            self._ix_running = True
+            self._ix = threading.Thread(target=self._index_main, name='vomedia-index', daemon=True)
+            self._ix.start()
+
+    def stop_index(self):
+        self._stop_ix.set()
+        t = self._ix
+        if t is not None and t is not threading.current_thread() and t.is_alive():
+            t.join(2)
+
+    def index_status(self):
+        st = dict(self._st)
+        st['running'] = self._ix_running
+        try:
+            r = self._db().execute('SELECT n_photo + n_video FROM dirs WHERE id=1').fetchone()
+            st['files'] = r[0] if r else 0
+        except sqlite3.Error:
+            st['files'] = 0
+        return st
+
+    def _index_main(self):
+        done = False
+        try:
+            if self._st['full']:
+                with self._tx() as c:           # повторить файлы с прежними ошибками разбора
+                    c.execute('UPDATE files SET meta=0 WHERE meta=2')
+                self._meta_event.set()
+            done = self._walk()
+            if done and self._st['full']:
+                self.recompute_totals()
+                with self._tx() as c:
+                    c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('full_done', ?)", (str(time.time()),))
+        except Exception as e:
+            if not self._closed:
+                log.exception('Index walk failed')
+                self._st['error'] = str(e) or e.__class__.__name__
+        finally:
+            self._st['finished'] = time.time()
+            self._st['current'] = ''
+            with self._ixlock:
+                self._ix_running = False
+            self._meta_event.set()
+
+    def _walk(self):
+        """Обход в ширину. True — дошли до конца (не остановили, корень читался)."""
+        queue = deque([(1, '')])
+        errors = 0
+        while queue:
+            if self._stop_ix.is_set() or self._closed:
+                return False
+            self._pause(self._stop_ix)
+            if self._stop_ix.is_set() or self._closed:
+                return False
+            did, rel = queue.popleft()
+            self._st['current'] = rel
+            try:
+                children = self._index_dir(did, rel)
+                errors = 0
+            except Exception as e:
+                if self._closed:
+                    return False
+                log.warning('Skipping folder %r: %s', rel or '/', e)
+                errors += 1
+                if did == 1:
+                    self._st['error'] = 'Cannot read library root: %s' % e
+                    return False
+                if errors >= MAX_ERRORS:
+                    self._st['error'] = 'Too many unreadable folders in a row (library offline?)'
+                    return False
+                continue
+            queue.extend(children)
+        return True
+
+    def _index_dir(self, did, rel):
+        """Шаг обхода: при необходимости перечитать папку; вернуть известные подпапки [(id, rel)]."""
+        c = self._db()
+        r = c.execute('SELECT mtime, listed FROM dirs WHERE id=?', (did,)).fetchone()
+        if r is None:                           # убрана параллельным refresh_dir
+            return []
+        path = self._abs(rel)
+        dmtime = os.stat(path).st_mtime
+        self._st['dirs'] += 1
+        if self._st['full'] or r[1] is None or r[0] is None or dmtime != r[0]:
+            subs, files = list_folder(path)
+            with self._tx() as w:
+                res = self._apply(w, did, dmtime, subs, files)
+            if res is None:
+                return []
+            self._unlink_thumbs(res[1])
+            if res[2]:
+                self._meta_event.set()
+            self._st['listed'] += 1
+        return c.execute('SELECT id, rel FROM dirs WHERE parent=?', (did,)).fetchall()
+
+    # ─── нить метаданных ───
+
+    def _meta_batch(self):
+        """До META_BATCH файлов с meta=0: сначала из приоритетных папок, потом любые."""
+        c = self._db()
+        out = []
+        with self._plock:
+            prio = list(self._prio)
+        for rel in reversed(prio):
+            if len(out) >= META_BATCH:
+                break
+            r = c.execute('SELECT id FROM dirs WHERE rel=?', (rel,)).fetchone()
+            if r is None:
+                continue
+            for fid, name, kind, size, mt in c.execute(
+                    'SELECT id, name, kind, size, mtime FROM files WHERE dir=? AND meta=0 LIMIT ?',
+                    (r[0], META_BATCH - len(out))):
+                out.append((fid, rel, name, kind, size, mt))
+        if len(out) < META_BATCH:
+            seen = set(x[0] for x in out)
+            for fid, rel, name, kind, size, mt in c.execute(
+                    'SELECT f.id, d.rel, f.name, f.kind, f.size, f.mtime FROM files f '
+                    'JOIN dirs d ON d.id=f.dir WHERE f.meta=0 LIMIT ?', (META_BATCH,)):
+                if fid in seen:
+                    continue
+                out.append((fid, rel, name, kind, size, mt))
+                if len(out) >= META_BATCH:
+                    break
+        return out
+
+    def _meta_flush(self, rows):
+        # условие по size/mtime: файл мог измениться, пока его читали
+        with self._tx() as c:
+            c.executemany('UPDATE files SET w=?, h=?, duration=?, rot=?, meta=? '
+                          'WHERE id=? AND meta=0 AND mtime IS ? AND size IS ?', rows)
+
+    def _meta_process(self, batch):
+        done = []
+        for fid, rel, name, kind, size, mt in batch:
+            self._pause()
+            if self._closed:
+                break
+            path = self._abs(rel, name)
+            try:
+                m = meta.read_meta(path, 'photo' if kind == KIND_PHOTO else 'video') or {}
+            except Exception:
+                m = {}
+            w, h, dur = m.get('w'), m.get('h'), m.get('duration')
+            ok = w is not None or h is not None or dur is not None
+            if not ok and not os.path.isdir(self.root):
+                break                           # NAS пропала посреди пачки: не метить файлы ошибкой
+            done.append((w, h, dur, m.get('rot') or 1, 1 if ok else 2, fid, mt, size))
+            if len(done) >= META_FLUSH:
+                self._meta_flush(done)
+                done = []
+        if done:
+            self._meta_flush(done)
+
+    def _meta_main(self):
+        while not self._closed:
+            try:
+                self._pause()
+                if self._closed:
+                    break
+                batch = self._meta_batch()
+                if not batch:
+                    self._meta_event.clear()
+                    batch = self._meta_batch()      # сигнал мог прийти до clear()
+                    if not batch:
+                        self._meta_event.wait(60)
+                        continue
+                if not os.path.isdir(self.root):    # NAS недоступна — не метить файлы ошибкой
+                    self._meta_event.clear()        # иначе wait() вернётся сразу и нить будет крутиться
+                    self._meta_event.wait(30)
+                    continue
+                self._meta_process(batch)
+            except Exception:
+                if self._closed:
+                    break
+                log.exception('Meta thread error')
+                time.sleep(2)
+
+    # ─── миниатюры ───
+
+    def _set_thumb(self, fid, value):
+        with self._tx() as c:
+            c.execute('UPDATE files SET thumb=? WHERE id=?', (value, fid))
+
+    def get_thumb(self, fid):
+        """Миниатюра из кеша; для JPEG без неё — встроенная EXIF (сохраняется). Иначе None."""
+        row = self._db().execute('SELECT f.name, f.kind, f.thumb, d.rel FROM files f '
+                                 'JOIN dirs d ON d.id=f.dir WHERE f.id=?', (fid,)).fetchone()
+        if row is None:
+            return None
+        name, kind, th, rel = row
+        if th == 1:
+            try:
+                with open(self.thumb_file(fid), 'rb') as f:
+                    return f.read()
+            except OSError:                     # файл миниатюры потерян
+                self._set_thumb(fid, 0)
+                th = 0
+        if th == 0 and kind == KIND_PHOTO and fid not in self._noexif \
+                and name.lower().endswith(('.jpg', '.jpeg')):
+            data = None
+            try:
+                data = meta.exif_thumb(self._abs(rel, name))
+            except Exception:
+                data = None
+            if data and self.put_thumb(fid, data):
+                return bytes(data)
+            if len(self._noexif) > 200000:
+                self._noexif.clear()
+            self._noexif.add(fid)
+        return None
+
+    def put_thumb(self, fid, data):
+        """Сохранить миниатюру (JPEG ≤ 512 КБ) через .part + os.replace, thumb=1."""
+        if not data or len(data) > MAX_THUMB or bytes(data[:2]) != b'\xff\xd8':
+            return False
+        if self._db().execute('SELECT 1 FROM files WHERE id=?', (fid,)).fetchone() is None:
+            return False
+        path = self.thumb_file(fid)
+        tmp = '%s.%d.part' % (path, threading.get_ident())
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning('Cannot save thumbnail %s: %s', fid, e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+        with self._tx() as c:
+            n = c.execute('UPDATE files SET thumb=1 WHERE id=?', (fid,)).rowcount
+        if n == 0:                              # файл исчез из кеша, пока писали
+            self._unlink_thumbs([fid])
+            return False
+        return True
