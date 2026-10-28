@@ -484,5 +484,5 @@ Esc в HTML-полноэкранном режиме перехватывает �
 
 ## Настройки (добавляются к прежним)
 
-`autoplay` (false), `next` (false), `loop` (false), `slide` (0), `slideSec` (3), `rate` (1), `rateUI` (false), `flat` (false), `fav` ([]), `tsort` ('name' | 'date' | 'size' | 'count' — своя сортировка веток дерева, над деревом), `tdesc` (false).
+`autoplay` (false), `next` (false), `loop` (false), `slide` (0), `slideSec` (3), `rate` (1), `rateUI` (false), `flat` (false), `fav` ([]), `tsort` ('name' | 'date' | 'size' | 'count' — своя сортировка веток дерева, над деревом), `tdesc` (false). `sort`/`desc`/`tsort`/`tdesc` общие для всех библиотек: сервер хранит их в `shared` в settings.json и подмешивает при загрузке. При выборе ключа направление ставится само: имя — по возрастанию, остальное (дата — сначала новые) — по убыванию.
 Значения по умолчанию и проверку типов каждый исполнитель делает в своём файле при загрузке (`if (typeof S.x !== ...) S.x = ...`).

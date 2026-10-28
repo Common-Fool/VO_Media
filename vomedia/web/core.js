@@ -91,6 +91,9 @@ function saveNow() {
   const body = JSON.stringify(Object.assign({}, S, {_root: BOOT.root}));
   return fetch(q('/api/settings'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body, keepalive: true}).catch(() => {});
 }
+// направление по умолчанию при выборе ключа: размер, длительность, число файлов — от большего,
+// дата — сначала новые, имя — от А до Я
+const sortDesc = k => k !== 'name';
 function setS(k, v) {
   S[k] = v;
   clearTimeout(saveTimer);

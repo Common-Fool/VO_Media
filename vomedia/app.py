@@ -78,6 +78,10 @@ def die(msg):
 
 # ───────────────────────── настройки ─────────────────────────
 
+# настройки, общие для всех библиотек (не по папке): сортировка сетки и дерева
+SHARED_KEYS = ('sort', 'desc', 'tsort', 'tdesc')
+
+
 def settings_file():
     return os.path.join(app_dir(), 'settings.json')
 
@@ -338,8 +342,13 @@ class App:
 
     def load_settings(self):
         """Настройки интерфейса открытой папки (объект как есть)."""
-        d = (read_all().get('roots') or {}).get(root_key(self._root))
-        return d if isinstance(d, dict) else {}
+        a = read_all()
+        d = (a.get('roots') or {}).get(root_key(self._root))
+        d = dict(d) if isinstance(d, dict) else {}
+        g = a.get('shared')
+        if isinstance(g, dict):
+            d.update((k, g[k]) for k in SHARED_KEYS if k in g)
+        return d
 
     def save_settings(self, new):
         if not isinstance(new, dict):
@@ -358,6 +367,9 @@ class App:
             roots = d.get('roots')
             if not isinstance(roots, dict):
                 roots = d['roots'] = {}
+            g = {k: new.pop(k) for k in SHARED_KEYS if k in new}
+            if g:
+                d['shared'] = g
             roots[root_key(self._root)] = new
             try:
                 write_all(d)

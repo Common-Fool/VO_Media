@@ -352,10 +352,10 @@ function syncControls() {
 
 function wireControls() {
   const blurAfter = el => el.addEventListener('change', () => el.blur());
-  $('#srt').addEventListener('change', e => { setS('sort', e.target.value); resort(); });
+  $('#srt').addEventListener('change', e => { setS('sort', e.target.value); setS('desc', sortDesc(S.sort)); syncControls(); resort(); });
   $('#sdir').onclick = () => { setS('desc', !S.desc); syncControls(); resort(); };
   $('#flt').addEventListener('change', e => { setS('filter', e.target.value); resort(); });
-  $('#tsrt').addEventListener('change', e => { setS('tsort', e.target.value); resortTree(); });
+  $('#tsrt').addEventListener('change', e => { setS('tsort', e.target.value); setS('tdesc', sortDesc(S.tsort)); syncControls(); resortTree(); });
   $('#tsdir').onclick = () => { setS('tdesc', !S.tdesc); syncControls(); resortTree(); };
   blurAfter($('#srt')); blurAfter($('#tsrt')); blurAfter($('#flt')); blurAfter($('#sz'));
   let szRaf = 0;
@@ -374,7 +374,7 @@ function wireControls() {
   $('#lhead').addEventListener('click', e => {
     const s = e.target.closest('[data-s]');
     if (!s) return;
-    if (S.sort === s.dataset.s) setS('desc', !S.desc); else setS('sort', s.dataset.s);
+    if (S.sort === s.dataset.s) setS('desc', !S.desc); else { setS('sort', s.dataset.s); setS('desc', sortDesc(S.sort)); }
     syncControls();
     resort();
   });
