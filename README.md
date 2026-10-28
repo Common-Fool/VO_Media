@@ -70,7 +70,7 @@ Folder view:
 |---|---|
 | `←` `→` `↑` `↓` | Select a tile (folders and files in one order) |
 | `Home` `End` | First / last tile |
-| `PgUp` `PgDn` | Page up / down |
+| `PgUp` `PgDn` | Previous / next folder with files (through the whole tree) |
 | `Enter` or `Space` | Open: enter a folder or view a file |
 | `Backspace` or `Alt+↑` | Up one level |
 | `[` and `]` | Previous / next folder of the same level |
@@ -101,6 +101,8 @@ Viewer:
 | `M` | Mute |
 | `I` | Show / hide the bottom bar |
 | `Esc` | Leave full screen, otherwise close the viewer |
+| `\` | Close the viewer (also from full screen) |
+| `Backspace` | Video: back to the start |
 | Mouse wheel | Next / previous file |
 | Click on the picture | Close the viewer (in full screen: play / pause a video) |
 | Double click | Full screen on / off |

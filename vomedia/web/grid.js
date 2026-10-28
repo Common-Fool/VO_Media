@@ -282,6 +282,19 @@ async function siblingDir(delta) {
   } catch (e) { toast(e.message, true); }
 }
 
+// PgUp/PgDn: соседняя папка со своими файлами (порядок как у перехода между папками в просмотрщике)
+let crossBusy = false;
+async function gridCross(step) {
+  if (crossBusy || MODE === 'search' || MODE === 'new') return;
+  crossBusy = true;
+  try {
+    const nb = await getJson(q('/api/neighbor?rel=' + encodeURIComponent(curRel) + '&step=' + step));
+    if (nb.rel == null) toast(step > 0 ? 'Last folder' : 'First folder');
+    else await openDir(nb.rel);
+  } catch (e) { toast('Cannot open the folder: ' + e.message, true); }
+  finally { crossBusy = false; }
+}
+
 function gridKey(e) {
   const k = e.key, n = list.length;
   if (e.altKey && k === 'ArrowUp') { upLevel(); return true; }
@@ -292,14 +305,7 @@ function gridKey(e) {
     case 'ArrowRight': if (n) setSel(Math.min(n - 1, i + 1), true); return true;
     case 'ArrowUp': if (n) setSel(moveVert(i, -1), true); return true;
     case 'ArrowDown': if (n) setSel(moveVert(i, 1), true); return true;
-    case 'PageUp': case 'PageDown': {
-      if (!n) return true;
-      const rows = Math.max(1, Math.floor($scroll.clientHeight / G.rowH) - 1), d = k === 'PageUp' ? -1 : 1;
-      let j = i;
-      for (let r = 0; r < rows; r++) { const t = moveVert(j, d); if (t === j) break; j = t; }
-      setSel(j, true);
-      return true;
-    }
+    case 'PageUp': case 'PageDown': gridCross(k === 'PageUp' ? -1 : 1); return true;
     case 'Home': if (n) setSel(0, true); return true;
     case 'End': if (n) setSel(n - 1, true); return true;
     case 'Enter': case ' ': if (n) openItem(i); return true;

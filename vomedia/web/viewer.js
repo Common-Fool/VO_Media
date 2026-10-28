@@ -860,8 +860,15 @@ function viewerKey(e) {
   const L = /^Key[A-Z]$/.test(e.code || '') ? e.code.slice(3).toLowerCase() : String(k).toLowerCase();
   if (k === 'Escape') { if (S.slide) vSetSlide(0); if (fsOn) leaveFs(); else closeViewer(); return true; }
   if (e.altKey || e.metaKey) return false;
+  if (!e.ctrlKey && (e.code === 'Backslash' || e.code === 'IntlBackslash')) {   // \ — сразу в сетку, и из полного экрана
+    if (S.slide) vSetSlide(0);
+    if (fsOn) leaveFs();
+    closeViewer();
+    return true;
+  }
   const f = V.list[V.i];
   const vid = vVideo(f) && !V.bad;
+  if (k === 'Backspace' && !e.ctrlKey) { if (vid) vSeekTo(0); return true; }
   if (!e.ctrlKey && (e.code === 'Comma' || e.code === 'Period' || [',', '.', '<', '>'].includes(k))) {
     const dir = e.code === 'Comma' || k === ',' || k === '<' ? -1 : 1;
     if (e.shiftKey) vRate(dir, false);
