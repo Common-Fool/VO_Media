@@ -53,7 +53,7 @@ function fsChanged() {
 
 /* ───── просмотрщик ───── */
 
-const V = {open: false, list: [], i: -1, seq: 0, sess: 0, hop: false, cache: new Map(), vsrc: false, raf: 0, drag: false, barOff: false,
+const V = {open: false, list: [], i: -1, seq: 0, sess: 0, hop: false, cache: new Map(), vsrc: false, raf: 0, drag: false, barOff: false, seekT: null,
   idleT: 0, spinT: 0, hudT: 0, wt: 0, clickT: 0, file: null, slideT: 0, loadT: 0, moveRaf: 0,
   failed: new Set(), prefetched: new Set(), neighbors: new Set(), preAbort: null,
   watched: 0, watchAt: 0, saveAt: 0, playing: false, resumed: false, removed: false, bad: false};
@@ -350,6 +350,7 @@ function vLeaveVideo() {
     V.vsrc = false;
     $vv.pause();
     $vv.removeAttribute('src');
+    V.seekT = null;
     $vv.load();                    // освободить соединение
     V.vsrc = false;
   }
@@ -390,6 +391,7 @@ function vShow(i, play) {
     V.vsrc = true;
     // loadeddata нужен и при выключенном autoplay: проверяем возможность показать первый кадр.
     $vv.preload = 'auto';
+    V.seekT = null;
     $vv.src = fUrl(f.id);
     V.loadT = setTimeout(() => { if (V.open && V.seq === seq && $vv.readyState < 2) vCannotPlay(); }, 8000);
     vUi();
@@ -533,7 +535,7 @@ async function vCross(step, slide) {
 const vDur = () => (isFinite($vv.duration) && $vv.duration > 0) ? $vv.duration : ((V.file && V.file.duration) || 0);
 function vUi() {
   if (!V.open) return;
-  const d = vDur(), t = V.vsrc ? $vv.currentTime : 0;
+  const d = vDur(), t = V.vsrc ? (V.seekT != null ? V.seekT : $vv.currentTime) : 0;
   const p = d ? clamp(t / d, 0, 1) * 100 : 0;
   $vfill.style.width = p + '%';
   $vknob.style.left = p + '%';
@@ -552,6 +554,7 @@ function vLoadSrc() {
   if (!V.open || V.vsrc || !vVideo(f) || V.bad) return;
   V.vsrc = true;
   $vv.preload = 'metadata';
+  V.seekT = null;
   $vv.src = fUrl(f.id);
 }
 function vToggle() {
@@ -564,10 +567,17 @@ function vSeekTo(t) {
   const f = V.list[V.i];
   if (!V.open || !vVideo(f) || V.bad) return;
   vLoadSrc();
-  try { $vv.currentTime = clamp(t, 0, vDur() || t); } catch (_) { /* метаданные ещё не готовы */ }
+  t = clamp(t, 0, vDur() || t);
+  // зажатая клавиша шлёт ~30 перемоток в секунду: каждая новая обрывала бы прошлую до показа кадра.
+  // Пока идёт перемотка, копим цель; последнюю отправит 'seeked'.
+  if ($vv.seeking) V.seekT = t;
+  else {
+    V.seekT = null;
+    try { $vv.currentTime = t; } catch (_) { /* метаданные ещё не готовы */ }
+  }
   vUi();
 }
-const vSeekBy = dt => vSeekTo(($vv.currentTime || 0) + dt);
+const vSeekBy = dt => vSeekTo((V.seekT != null ? V.seekT : $vv.currentTime || 0) + dt);
 
 function applyVol() {
   $vv.volume = S.volume;
@@ -973,6 +983,12 @@ function initViewer() {
     if (!V.open || !V.vsrc || !$vv.paused) return;
     vWatch(); V.playing = false;
     $vplay.classList.remove('playing'); vUi();
+  });
+  $vv.addEventListener('seeked', () => {
+    if (V.seekT == null || !V.open || !V.vsrc) return;
+    const t = V.seekT;
+    V.seekT = null;
+    if (Math.abs(t - $vv.currentTime) > 0.05) try { $vv.currentTime = t; } catch (_) { /* нет метаданных */ }
   });
   $vv.addEventListener('ended', vEnded);
   $vv.addEventListener('timeupdate', () => { if (V.open && V.vsrc && !V.bad) { vWatch(); vProgress(false); vUi(); } });
