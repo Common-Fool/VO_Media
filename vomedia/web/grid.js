@@ -357,6 +357,8 @@ function storyGet(f, onProgress) {
       storyRelease(t);
     }
   })();
+  work.catch(() => {});              // после отмены ошибку work никто не ждёт — без «Uncaught (in promise)»
+  aborted.catch(() => {});
   const p = Promise.race([work, aborted]);
   p.cancel = () => {
     if (t.dead || t.done) return;
@@ -1239,6 +1241,10 @@ function fileChanged(nf2) {
     M.dirty = true;
     const t = $('#vname');
     if (t && V.list[V.i] && V.list[V.i].id === cur.id) t.textContent = cur.name;
+  } else if (MODE === 'flat' && M.total > M.items.length && S.sort === 'name') {
+    // плоский вид грузится порциями в порядке сервера: новое имя сдвигает порядок, и следующая порция
+    // дала бы повтор и пропуск — загрузить заново
+    openFlat(curRel);
   } else {
     rerender();
   }

@@ -64,9 +64,9 @@ def route(ctx, post, p, q, raw):
             return 200, show_in_explorer(paths_of(ctx, [b.get('id')])[0], select=True)
         return 200, show_in_explorer(folder_of(ctx, b.get('rel')), select=False)
     if key == 'file/rename':
-        return 200, rename(ctx, b.get('id'), b.get('name'))
+        return 200, rename(ctx, b.get('root'), b.get('id'), b.get('old'), b.get('name'))
     if key == 'file/delete':
-        return 200, delete(ctx, b.get('ids'))
+        return 200, delete(ctx, b.get('root'), b.get('ids'), b.get('names'))
     if key == 'file/copy':
         what = b.get('what') or 'files'
         if what == 'path':
@@ -109,6 +109,25 @@ def rows_of(ctx, ids):
     rows = [r for r in rows if r]
     if not rows:
         raise ValueError('these files are no longer in the library')
+    return rows
+
+
+def checked_rows(lib, root, ids, names):
+    """Строки для удаления/переименования с проверкой, что страница видит ту же библиотеку и те же файлы:
+    устаревшая вкладка (другая открытая папка) или id, занятый новым файлом, не должны задеть чужой файл."""
+    if not isinstance(root, str) or os.path.normcase(os.path.abspath(root)) != os.path.normcase(lib.root):
+        raise ValueError('another folder is open now — reload the page')
+    if not isinstance(ids, list) or not isinstance(names, list) or not ids or len(ids) != len(names) or len(ids) > 10000:
+        raise ValueError('no files given')
+    rows, seen = [], set()
+    for fid, name in zip(ids, names):
+        if not isinstance(fid, int) or isinstance(fid, bool) or fid in seen:
+            continue
+        seen.add(fid)
+        r = lib.file_row(fid)
+        if not r or r['name'] != name:
+            raise ValueError('the file list is out of date — refresh the folder (F5)')
+        rows.append(r)
     return rows
 
 
@@ -367,27 +386,29 @@ def check_name(name):
     return name
 
 
-def rename(ctx, fid, name):
-    """Переименовать файл в той же папке; id и миниатюра сохраняются (Library.file_renamed)."""
-    row = rows_of(ctx, [fid])[0]
+def rename(ctx, root, fid, old_name, name):
+    """Переименовать файл в той же папке; id и миниатюра сохраняются (Library.file_renamed).
+
+    Вся операция — на одной открытой библиотеке; переименование на диске и запись в кеш — под блокировкой записи
+    кеша, чтобы между ними не влезло слияние списка этой папки (оно сопоставляет файлы по имени).
+    """
     name = check_name(name)
-    old = row['path']
-    new = os.path.join(os.path.dirname(old), name)
-    if name == row['name']:
-        return {'ok': True, 'file': None}
-    # смена только регистра в Windows: файл «существует» под новым именем — это он сам
-    if os.path.exists(new) and os.path.normcase(new) != os.path.normcase(old):
-        raise ValueError('a file with this name already exists')
-    try:
-        os.rename(old, new)
-    except OSError as e:
-        raise ValueError(explain(e))
     with ctx.use() as lib:
-        if hasattr(lib, 'file_renamed'):
-            f = lib.file_renamed(fid, name)
-            return {'ok': True, 'file': f} if f else {'ok': True, 'removed': True}
-        lib.refresh_dir(row_rel(lib, old))       # без file_renamed: перечитать папку (id сменится)
-    return {'ok': True, 'file': None}
+        row = checked_rows(lib, root, [fid], [old_name])[0]
+        old = row['path']
+        new = os.path.join(os.path.dirname(old), name)
+        if name == row['name']:
+            return {'ok': True, 'file': None}
+        # смена только регистра в Windows: файл «существует» под новым именем — это он сам
+        if os.path.exists(new) and os.path.normcase(new) != os.path.normcase(old):
+            raise ValueError('a file with this name already exists')
+        with lib.wlock:
+            try:
+                os.rename(old, new)
+            except OSError as e:
+                raise ValueError(explain(e))
+            f = lib.file_renamed(row['id'], name)
+    return {'ok': True, 'file': f} if f else {'ok': True, 'removed': True}
 
 
 def row_rel(lib, path):
@@ -427,9 +448,8 @@ def recycle(path):
         os.remove(path)
         return
     p = plain(path)
-    if len(p) >= 260:                            # SHFileOperation не умеет длинные пути
-        os.remove(path)
-        return
+    if len(p) >= 260:                            # SHFileOperation не умеет длинные пути: удалить навсегда нельзя молча
+        raise OSError('the path is too long for the Recycle Bin — delete this file in Explorer')
     ctypes.windll.ole32.CoInitializeEx(None, 2)  # оболочке нужна COM-квартира в этой нити
     op = SHFILEOPSTRUCTW(None, FO_DELETE, p + '\0', None,
                          FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI, False, None, None)
@@ -439,11 +459,11 @@ def recycle(path):
             raise OSError('could not delete (code %d)' % r)
 
 
-def delete(ctx, ids):
-    """Удалить файлы; затем перечитать их папки, чтобы кеш и суммы обновились."""
-    rows = rows_of(ctx, ids)
+def delete(ctx, root, ids, names):
+    """Удалить файлы; затем перечитать их папки, чтобы кеш и суммы обновились (всё — на одной библиотеке)."""
     deleted, errors, folders = [], [], set()
     with ctx.use() as lib:
+        rows = checked_rows(lib, root, ids, names)
         for r in rows:
             try:
                 recycle(r['path'])

@@ -476,13 +476,22 @@ class Handler(BaseHTTPRequestHandler):
         if hit is not None:
             rng, (off, data) = hit
             code, (a, b) = (200, (0, size - 1)) if rng is None else (206, rng)
-            self.file_headers(code, ctype, a, b, size, mtime)
             end = min(b + 1, off + len(data))
-            self.wfile.write(data[a - off:end - off])
-            if end > b:
+            if end > b:                                  # диапазон целиком в памяти
+                self.file_headers(code, ctype, a, b, size, mtime)
+                self.wfile.write(data[a - off:end - off])
                 return
-            with open(path, 'rb', buffering=0) as f:     # остаток за пределами куска — с диска
-                return self.copy_file(f, end, b - end + 1)
+            # остаток — с диска: сначала убедиться, что это тот же файл (его могли заменить после предзагрузки),
+            # иначе получилась бы смесь двух файлов; не совпал — отдаём целиком с диска
+            f = open(path, 'rb', buffering=0)
+            try:
+                st = os.fstat(f.fileno())
+                if st.st_size == size and abs(st.st_mtime - mtime) < 0.001:
+                    self.file_headers(code, ctype, a, b, size, mtime)
+                    self.wfile.write(data[a - off:end - off])
+                    return self.copy_file(f, end, b - end + 1)
+            finally:
+                f.close()
         with open(path, 'rb', buffering=0) as f:
             st = os.fstat(f.fileno())
             size = st.st_size

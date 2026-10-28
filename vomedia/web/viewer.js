@@ -127,7 +127,7 @@ function vSlideAdvance() {
   if (!V.open || !S.slide || V.hop) return;
   const rel = vRel(V.file), mode = S.slide;
   let i = V.i + 1;
-  if (mode !== 3) {
+  if (mode !== 3 && curMode() === 'dir') {         // в поиске/плоском виде/«New» папка — весь список
     while (i < V.list.length && vRel(V.list[i]) !== rel) i++;
     if (i === V.list.length && mode === 2) i = V.list.findIndex(f => vRel(f) === rel);
   }
@@ -155,7 +155,7 @@ function vEnded() {
   const rel = vRel(V.file);
   for (let i = V.i + 1; i < V.list.length; i++) {
     const f = V.list[i];
-    if (vRel(f) === rel && f.kind === 'video') { vShow(i, true); return; }
+    if (vRel(f) === rel && vVideo(f)) { vShow(i, true); return; }
   }
 }
 
@@ -245,7 +245,7 @@ function vPhotoSoon() { if (V.open && !VP.raf) VP.raf = requestAnimationFrame(vP
 function vZoom(z, x, y) {
   if (!vPhoto() || !$vi.naturalWidth) return;
   const r = $('#vstage').getBoundingClientRect(), old = VP.z;
-  VP.z = clamp(z, 1, 8);
+  VP.z = clamp(z, Math.min(1, 1 / (VP.fit || 1)), 8);
   const ratio = VP.z / old;
   const cx = x == null ? 0 : x - r.left - r.width / 2, cy = y == null ? 0 : y - r.top - r.height / 2;
   VP.x = cx - (cx - VP.x) * ratio; VP.y = cy - (cy - VP.y) * ratio;
@@ -502,7 +502,7 @@ async function vCross(step, slide) {
     for (let n = 0; n < 50; n++) {
       const nb = await getJson(q('/api/neighbor?rel=' + encodeURIComponent(rel) + '&step=' + step));
       if (!alive()) return;
-      if (nb.rel == null) { if (slide) vSetSlide(0); hud(step > 0 ? 'Last folder' : 'First folder'); return; }
+      if (nb.rel == null) { if (slide || S.slide) vSetSlide(0); hud(step > 0 ? 'Last folder' : 'First folder'); return; }
       rel = normRel(nb.rel);
       // дешёвая проверка по кешу: пустые после фильтра папки пропускаем, не трогая сетку
       const j = await getJson(dirUrl(rel, false));
@@ -510,7 +510,7 @@ async function vCross(step, slide) {
       if (!j.missing && !(j.files || []).some(f => S.filter === 'all' || f.kind === S.filter)) continue;
       const d = await hopLoad(rel, j.missing ? null : j);
       if (!alive()) return;
-      if (!d) { if (slide) vSetSlide(0); hud('Cannot open the folder', true); return; }
+      if (!d) { if (slide || S.slide) vSetSlide(0); hud('Cannot open the folder', true); return; }
       if (!files.length) continue;
       V.list = files.slice();
       vShow(step > 0 ? 0 : files.length - 1);
@@ -518,9 +518,9 @@ async function vCross(step, slide) {
       return;
     }
     hud('No files in the nearby folders');
-    if (slide) vSetSlide(0);
+    if (slide || S.slide) vSetSlide(0);
   } catch (e) {
-    if (alive()) { if (slide) vSetSlide(0); toast('Cannot open the folder: ' + e.message, true); }
+    if (alive()) { if (slide || S.slide) vSetSlide(0); toast('Cannot open the folder: ' + e.message, true); }
   } finally {
     if (V.sess === sess) {
       V.hop = false;
@@ -842,6 +842,8 @@ function pvStop() {
 function viewerKey(e) {
   if (!V.open) return false;
   const k = e.key;
+  // буква по физической клавише: в русской раскладке e.key — «я», «к», «ь»…
+  const L = /^Key[A-Z]$/.test(e.code || '') ? e.code.slice(3).toLowerCase() : String(k).toLowerCase();
   if (k === 'Escape') { if (S.slide) vSetSlide(0); if (fsOn) leaveFs(); else closeViewer(); return true; }
   if (e.altKey || e.metaKey) return false;
   const f = V.list[V.i];
@@ -852,8 +854,8 @@ function viewerKey(e) {
     else if (vid && $vv.paused) vSeekBy(dir / 30);
     return true;
   }
-  if (!e.ctrlKey && (k.toLowerCase() === 'z' || k.toLowerCase() === 'r')) {
-    vPhotoKey(k.toLowerCase() === 'r');
+  if (!e.ctrlKey && (L === 'z' || L === 'r')) {
+    vPhotoKey(L === 'r');
     return true;
   }
   switch (k) {
@@ -870,13 +872,12 @@ function viewerKey(e) {
     case 'Enter': toggleFs(); return true;
     case 'ArrowUp': vVol(0.05); return true;
     case 'ArrowDown': vVol(-0.05); return true;
-    case 'm': case 'M': vMute(); return true;
-    case 't': case 'T': tlToggle(); return true;
-    case 'i': case 'I':
-      V.barOff = !V.barOff;
-      $v.classList.toggle('nobar', V.barOff);
-      return true;
-    default: return false;
+    default:
+      if (e.ctrlKey) return false;
+      if (L === 'm') { vMute(); return true; }
+      if (L === 't') { tlToggle(); return true; }
+      if (L === 'i') { V.barOff = !V.barOff; $v.classList.toggle('nobar', V.barOff); return true; }
+      return false;
   }
 }
 

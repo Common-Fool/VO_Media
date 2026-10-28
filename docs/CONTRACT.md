@@ -431,8 +431,8 @@ Esc в HTML-полноэкранном режиме перехватывает �
 | GET | `/api/player` | `{players: [{id, name, path, current}], current: {name, path}}` — как `players_menu()` в VSPO; `path: ''` — программа системы |
 | POST | `/api/player/set`, `/api/player/pick` | `{id}` — выбрать из списка; `pick` — диалог выбора программы → `{ok}` / `{cancelled}` |
 | POST | `/api/play` | `{ids: [..]}` — открыть во внешнем плеере (MPC — плейлистом) → `{ok: true}` |
-| POST | `/api/file/rename` | `{id, name}` → `{ok: true, file: {..}}` (тот же id) или `{ok: true, removed: true}` (новое имя не медиа) |
-| POST | `/api/file/delete` | `{ids: [..]}` → `{deleted: [ids], errors: [{id, error}]}` — Windows: в корзину (`SHFileOperationW`, `FOF_ALLOWUNDO`); NAS — удаление (корзина Synology) |
+| POST | `/api/file/rename` | `{root, id, old, name}` (root — `BOOT.root`, old — имя, которое видит страница; не совпало — 409) → `{ok: true, file: {..}}` (тот же id) или `{ok: true, removed: true}` (новое имя не медиа) |
+| POST | `/api/file/delete` | `{root, ids: [..], names: [..]}` (сверка корня и имён, как у rename; длинный путь, который не уходит в корзину, — ошибка, а не удаление навсегда) → `{deleted: [ids], errors: [{id, error}]}` — Windows: в корзину (`SHFileOperationW`, `FOF_ALLOWUNDO`); NAS — удаление (корзина Synology) |
 | POST | `/api/file/copy` | `{ids: [..], what: 'files'}` — файлы в буфер (CF_HDROP, вставка в проводнике); `{ids}` или `{rel}` + `what: 'path'` — путь(и) текстом → `{ok: true}` |
 
 ## Страница — просмотрщик (Sonnet «viewer»)

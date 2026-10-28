@@ -142,7 +142,8 @@ async function renameFile(f) {
   if (name == null) return;
   const nn = name.trim();
   if (!nn || nn === f.name) return;
-  const r = await apiAct('/api/file/rename', {id: f.id, name: nn});
+  // root и старое имя: сервер сверяет, что страница видит ту же библиотеку и тот же файл (id мог достаться другому)
+  const r = await apiAct('/api/file/rename', {root: BOOT.root, id: f.id, old: f.name, name: nn});
   if (!r) return;
   if (r.removed) { fileRemoved(f.id); toast('Renamed. It is not a media file, so it is no longer listed'); return; }
   if (r.file) fileChanged(r.file);
@@ -150,7 +151,7 @@ async function renameFile(f) {
 }
 async function deleteFile(f) {
   if (!await ask('Delete ' + f.name + '? On a NAS it goes to the share\'s recycle bin if it is enabled.', 'Delete')) return;
-  const r = await apiAct('/api/file/delete', {ids: [f.id]});
+  const r = await apiAct('/api/file/delete', {root: BOOT.root, ids: [f.id], names: [f.name]});
   if (!r) return;
   if ((r.deleted || []).indexOf(f.id) >= 0) { fileRemoved(f.id); toast('Deleted'); return; }
   const er = (r.errors || [])[0];
