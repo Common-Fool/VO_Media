@@ -20,6 +20,16 @@
 .wb.done i{background:var(--ok)}
 .sub.path{color:#9aa0b8}
 
+/* раскадровка поверх миниатюры; элементы создаются один раз вместе с плиткой */
+.sb-frame,.sb-pos,.sb-spin{display:none;position:absolute;pointer-events:none}
+.sb-frame{inset:0;width:100%;height:100%;z-index:1}
+.sb-pos{left:0;right:0;bottom:0;height:3px;background:#0009;z-index:3}
+.sb-pos i{display:block;height:100%;background:var(--accg)}
+.sb-spin{right:8px;top:8px;width:14px;height:14px;border:2px solid #ffffff50;border-top-color:#fff;border-radius:50%;background:#0003;animation:spin .8s linear infinite;z-index:3}
+.th.sb-show .sb-frame,.th.sb-show .sb-pos,.th.sb-busy .sb-spin{display:block}
+.th.sb-show .pl,.th.sb-show .wb{visibility:hidden}
+.th.sb-show .dur{z-index:2}
+
 /* избранное в дереве */
 #favs{margin:0 0 8px;padding:0 0 8px;border-bottom:1px solid var(--line);max-height:30vh;overflow:auto}
 #favs .ph2{margin:2px 8px 4px}

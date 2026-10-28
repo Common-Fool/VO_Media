@@ -75,12 +75,14 @@ function update() {
 }
 
 function unmount(i, el) {
+  if (GS.hover && GS.hover.el === el) gridStoryStop();
   for (const im of el.querySelectorAll('img')) im.removeAttribute('src');
   el.remove();
   mounted.delete(i);
   if (i >= nd && list[i]) gen.pending.delete(list[i].id);
 }
 function clearMounted() {
+  gridStoryStop();
   for (const [i, el] of mounted) unmount(i, el);
   mounted.clear();
   $cells.textContent = '';
@@ -88,6 +90,7 @@ function clearMounted() {
 }
 
 function mountAll(ids) {
+  gridStoryInit();
   const tmp = document.createElement('div');
   tmp.innerHTML = ids.map(cellHtml).join('');
   const els = Array.from(tmp.children);
@@ -153,6 +156,8 @@ function fileHtml(f, i, st, sel) {
   else if (!thumbErr.has(f.id) && f.thumb === 1) src = tUrl(f);
   else f._w = true;                  // миниатюры нет — сразу в очередь генерации
   const vid = f.kind === 'video';
+  const scrub = vid && !isGif(f) ? '<canvas class="sb-frame" width="1" height="1" aria-hidden="true"></canvas>' +
+    '<span class="sb-pos" aria-hidden="true"><i></i></span><span class="sb-spin" title="Loading storyboard…" aria-hidden="true"></span>' : '';
   let sub = fmtSize(f.size);
   if (f.w && f.h) sub += ' · ' + f.w + '×' + f.h;
   // в режимах «из многих папок» вместо даты — папка файла
@@ -161,7 +166,7 @@ function fileHtml(f, i, st, sel) {
     : '<div class="sub">' + esc(fmtDate(f.mtime)) + '</div>';
   return '<div class="cell file' + sel + '" data-i="' + i + '" style="' + st + '"><div class="th"><div class="ph">' + (vid ? ICO_VID : ICO_PHOTO) +
     '</div><img alt="" decoding="async" loading="lazy"' + (src ? ' src="' + esc(src) + '"' : '') + '>' +
-    (vid ? '<span class="pl">' + ICO_PLAY + '</span>' + (f.duration != null ? '<span class="dur">' + fmtDur(f.duration) + '</span>' : '') : '') + wbHtml(f) +
+    (vid ? '<span class="pl">' + ICO_PLAY + '</span>' + (f.duration != null ? '<span class="dur">' + fmtDur(f.duration) + '</span>' : '') : '') + wbHtml(f) + scrub +
     '</div><div class="cap"><div class="nm" title="' + esc(f.name) + '">' + esc(f.name) + '</div><div class="sub">' + esc(sub) +
     '</div>' + sub2 + '</div></div>';
 }
@@ -308,6 +313,246 @@ function gridKey(e) {
       return true;
     default: return false;
   }
+}
+
+/* ───── общая раскадровка: без зависимости от просмотрщика и очереди миниатюр ───── */
+
+const SBN = 30, SBC = 6, SBR = 5, SBW = 320;
+const storyCache = new Map(), storyMissing = new Set();
+const storyKey = f => f.id + ':' + (f.mtime || 0);
+
+function storyPeek(f) {
+  const key = storyKey(f), s = storyCache.get(key);
+  if (s) { storyCache.delete(key); storyCache.set(key, s); }
+  return s;
+}
+
+// Promise -> {src: Image|canvas, fw, fh, got, state}; cancel() отменяет запрос и скрытое видео.
+// onProgress получает тот же набор полей после каждого готового кадра, включая неполный спрайт.
+function storyGet(f, onProgress) {
+  const cached = storyPeek(f);
+  if (cached) {
+    const p = Promise.resolve(cached);
+    p.cancel = () => {};
+    return p;
+  }
+  const t = {f: f, key: storyKey(f), state: 'load', src: null, fw: 0, fh: 0, got: 0,
+    dead: false, done: false, vid: null, im: null, rej: null, ac: new AbortController()};
+  let abort;
+  const aborted = new Promise((_, reject) => { abort = reject; });
+  const work = (async () => {
+    try {
+      const loaded = await storyLoad(t);
+      if (t.dead) throw new DOMException('Aborted', 'AbortError');
+      if (!loaded) await storyGen(t, onProgress);
+      if (t.dead) throw new DOMException('Aborted', 'AbortError');
+      t.state = 'ready';
+      const s = {src: t.src, fw: t.fw, fh: t.fh, got: SBN, state: 'ready'};
+      storyCache.delete(t.key);
+      storyCache.set(t.key, s);
+      while (storyCache.size > 20) storyCache.delete(storyCache.keys().next().value);
+      return s;
+    } finally {
+      t.done = true;
+      storyRelease(t);
+    }
+  })();
+  const p = Promise.race([work, aborted]);
+  p.cancel = () => {
+    if (t.dead || t.done) return;
+    t.dead = true;
+    t.ac.abort();
+    if (t.rej) t.rej();
+    if (t.im) t.im.removeAttribute('src');
+    storyRelease(t);
+    abort(new DOMException('Aborted', 'AbortError'));
+  };
+  return p;
+}
+
+async function storyLoad(t) {
+  if (storyMissing.has(t.key)) return false;
+  const r = await fetch(q('/s/' + t.f.id + '?v=' + encodeURIComponent(t.f.mtime || 0)), {signal: t.ac.signal});
+  if (r.status === 404) { storyMissing.add(t.key); return false; }
+  if (!r.ok) throw new Error('storyboard ' + r.status);
+  const blob = await r.blob();
+  if (t.dead) throw new DOMException('Aborted', 'AbortError');
+  const url = URL.createObjectURL(blob), im = t.im = new Image();
+  try {
+    im.src = url;
+    await im.decode();
+    if (t.dead) throw new DOMException('Aborted', 'AbortError');
+    const fw = im.naturalWidth / SBC, fh = im.naturalHeight / SBR;
+    if (fw < 8 || fh < 8) throw new Error('invalid storyboard');
+    t.src = im; t.fw = fw; t.fh = fh; t.got = SBN;
+    return true;
+  } finally {
+    t.im = null;
+    URL.revokeObjectURL(url);
+  }
+}
+
+// Ожидание события прерывается вместе с задачей, обработчики и таймер всегда снимаются.
+function waitVid(t, v, ev, ms) {
+  return new Promise((res, rej) => {
+    let tm = 0;
+    const fin = err => {
+      clearTimeout(tm);
+      v.removeEventListener(ev, ok);
+      v.removeEventListener('error', bad);
+      if (t.rej === abort) t.rej = null;
+      if (err) rej(err); else res();
+    };
+    const ok = () => fin(null);
+    const bad = () => fin(new Error('video error'));
+    const abort = () => fin(new DOMException('Aborted', 'AbortError'));
+    tm = setTimeout(() => fin(new Error('timeout')), ms);
+    t.rej = abort;
+    v.addEventListener(ev, ok, {once: true});
+    v.addEventListener('error', bad, {once: true});
+  });
+}
+
+function storyRelease(t) {
+  const v = t.vid;
+  if (!v) return;
+  t.vid = null;
+  v.removeAttribute('src');
+  try { v.load(); } catch (_) { /* нечего освобождать */ }
+}
+
+async function storyGen(t, onProgress) {
+  const v = t.vid = document.createElement('video');
+  v.muted = true; v.preload = 'metadata'; v.playsInline = true;
+  t.state = 'gen';
+  const meta = waitVid(t, v, 'loadedmetadata', 15000);
+  v.src = fUrl(t.f.id);
+  await meta;
+  const dur = v.duration, vw = v.videoWidth, vh = v.videoHeight;
+  if (!isFinite(dur) || dur <= 0 || !vw || !vh) throw new Error('no video');
+  let fh = Math.max(2, Math.round(SBW * vh / vw));
+  fh += fh & 1;
+  const c = document.createElement('canvas');
+  c.width = SBW * SBC; c.height = fh * SBR;
+  const x = c.getContext('2d');
+  x.imageSmoothingQuality = 'high';
+  t.src = c; t.fw = SBW; t.fh = fh;
+  for (let i = 0; i < SBN; i++) {
+    if (t.dead) throw new DOMException('Aborted', 'AbortError');
+    const seek = waitVid(t, v, 'seeked', 10000);
+    v.currentTime = dur * (i + 0.5) / SBN;
+    await seek;
+    if (t.dead) throw new DOMException('Aborted', 'AbortError');
+    x.drawImage(v, (i % SBC) * SBW, Math.floor(i / SBC) * fh, SBW, fh);
+    t.got = i + 1;
+    if (onProgress) onProgress(t);
+  }
+  storyRelease(t);
+  // toDataURL, а не toBlob: синхронное кодирование без ожидания простоя Chromium.
+  const blob = dataBlob(c.toDataURL('image/jpeg', 0.8));
+  fetch(q('/api/story/' + t.f.id), {method: 'POST', headers: {'Content-Type': 'image/jpeg'},
+    body: blob, signal: t.ac.signal}).then(r => {
+    if (r.ok) storyMissing.delete(t.key);       // после сохранения сервер снова может отдать спрайт
+  }).catch(() => {});
+}
+
+/* ───── кадры при наведении на картинку плитки ───── */
+
+const GS = {hover: null, raf: 0, x: 0, target: null, wired: false};
+function gridStoryBlocked() {
+  return V.open || frozen || document.hidden || !!$('#dlg:not([hidden]),#ov:not([hidden]),#menup:not([hidden]),#rootp:not([hidden]),#newp:not([hidden]),#ctxm:not([hidden])');
+}
+function gridStoryStop() {
+  cancelAnimationFrame(GS.raf); GS.raf = 0; GS.target = null;
+  const h = GS.hover;
+  GS.hover = null;
+  if (!h) return;
+  clearTimeout(h.tm);
+  if (h.task) h.task.cancel();
+  h.th.classList.remove('sb-show', 'sb-busy');
+  h.canvas.getContext('2d').clearRect(0, 0, h.canvas.width, h.canvas.height);
+}
+function gridStoryAlive(h) {
+  return GS.hover === h && h.el.isConnected && mounted.get(h.i) === h.el &&
+    list[h.i] === h.f && storyKey(h.f) === h.key && !gridStoryBlocked();
+}
+function gridStoryPaint(h) {
+  if (!gridStoryAlive(h)) { gridStoryStop(); return; }
+  if (!h.sprite) return;
+  const r = h.th.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  const k = clamp((GS.x - r.left) / r.width, 0, 1), idx = Math.min(SBN - 1, Math.floor(k * SBN));
+  const c = h.canvas, dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.round(r.width * dpr), ht = Math.round(r.height * dpr);
+  if (c.width !== w || c.height !== ht) { c.width = w; c.height = ht; h.idx = -1; }
+  if (h.idx !== idx) {
+    const s = h.sprite, ar = w / ht;
+    let sw = s.fw, sh = s.fh;
+    if (sw / sh > ar) sw = sh * ar; else sh = sw / ar;
+    c.getContext('2d').drawImage(s.src, (idx % SBC) * s.fw + (s.fw - sw) / 2,
+      Math.floor(idx / SBC) * s.fh + (s.fh - sh) / 2, sw, sh, 0, 0, w, ht);
+    h.idx = idx;
+  }
+  h.bar.style.width = (k * 100) + '%';
+  h.th.classList.add('sb-show');
+}
+function gridStorySoon() {
+  if (!GS.raf) GS.raf = requestAnimationFrame(() => {
+    GS.raf = 0;
+    if (GS.hover) gridStoryPaint(GS.hover);
+  });
+}
+async function gridStoryLoad(h) {
+  h.tm = 0;
+  if (!gridStoryAlive(h)) { if (GS.hover === h) gridStoryStop(); return; }
+  h.th.classList.add('sb-busy');
+  try {
+    h.task = storyGet(h.f);
+    const s = await h.task;
+    if (!gridStoryAlive(h)) return;
+    h.sprite = s;
+    gridStorySoon();
+  } catch (_) { /* нет декодера или ошибка сети — остаётся миниатюра */ }
+  finally { h.th.classList.remove('sb-busy'); }
+}
+function gridStoryPoint() {
+  GS.raf = 0;
+  const th = GS.target && GS.target.closest('.file .th');
+  if (!th || gridStoryBlocked()) { gridStoryStop(); return; }
+  if (GS.hover && GS.hover.th === th) { gridStoryPaint(GS.hover); return; }
+  const el = th.closest('.cell'), i = +el.dataset.i, f = list[i];
+  gridStoryStop();
+  if (!f || i < nd || f.kind !== 'video' || isGif(f)) return;
+  const h = GS.hover = {el: el, th: th, i: i, f: f, key: storyKey(f), tm: 0, task: null,
+    canvas: th.querySelector('.sb-frame'), bar: th.querySelector('.sb-pos i'), sprite: storyPeek(f), idx: -1};
+  if (h.sprite) gridStoryPaint(h);
+  else h.tm = setTimeout(() => gridStoryLoad(h), 700);
+}
+function gridStoryInit() {
+  if (GS.wired) return;
+  GS.wired = true;
+  const move = e => {
+    GS.x = e.clientX; GS.target = e.target;
+    if (!GS.raf) GS.raf = requestAnimationFrame(gridStoryPoint);
+  };
+  $cells.addEventListener('mouseover', move);
+  $cells.addEventListener('mousemove', move);
+  $cells.addEventListener('mouseout', e => {
+    const th = e.target.closest('.file .th');
+    if (th && (!e.relatedTarget || !th.contains(e.relatedTarget))) gridStoryStop();
+  });
+  // Прокрутка и смена раскладки не должны оставлять кадр под неподвижной мышью.
+  addEventListener('scroll', gridStoryStop, true);
+  addEventListener('resize', gridStoryStop);
+  addEventListener('blur', gridStoryStop);
+  addEventListener('pagehide', gridStoryStop);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) gridStoryStop(); });
+  const ob = new MutationObserver(() => { if (gridStoryBlocked()) gridStoryStop(); });
+  for (const id of ['dlg', 'ov', 'menup', 'rootp', 'newp', 'ctxm']) {
+    const el = $('#' + id);
+    if (el) ob.observe(el, {attributes: true, attributeFilter: ['hidden']});
+  }
+  ob.observe(document.body, {attributes: true, attributeFilter: ['class']});
 }
 
 /* ───── очередь миниатюр: только видимые плитки, 2 задачи одновременно ───── */

@@ -283,6 +283,7 @@ function hud(text, sticky) {
 function openViewer(f) {
   const i = files.indexOf(f);
   if (i < 0) return;
+  gridStoryStop();
   V.list = files.slice();
   V.open = true;
   V.sess++;
@@ -604,103 +605,29 @@ function barShow() {
 
 /* ───── раскадровка видео: 30 кадров, спрайт 6×5 ───── */
 
-const SBN = 30, SBC = 6, SBR = 5, SBW = 320;
-let ST = null;                      // раскадровка текущего видео: {f, state, src, fw, fh, got, vid, rej, dead, tm, im}
+let ST = null;                      // состояние показа текущей раскадровки; сама задача общая с сеткой
 
 // нужна ли раскадровка: создаётся один раз на видео (после неудачи не повторяем)
 function storyNeed(delay) {
   const f = V.list[V.i];
   if (!V.open || !vVideo(f) || V.bad || ST) return;
-  const st = ST = {f: f, state: 'load', src: null, fw: 0, fh: 0, got: 0, vid: null, rej: null, dead: false, tm: 0, im: null};
-  st.tm = setTimeout(() => storyLoad(st), delay || 0);
-}
-
-function storyLoad(st) {
-  if (st.dead) return;
-  const im = st.im = new Image();
-  im.onload = () => {
+  const st = ST = {f: f, state: 'load', src: null, fw: 0, fh: 0, got: 0, dead: false, tm: 0, task: null};
+  st.tm = setTimeout(async () => {
     if (st.dead) return;
-    st.im = null;
-    const fw = im.naturalWidth / SBC, fh = im.naturalHeight / SBR;
-    if (fw < 8 || fh < 8) { storyGen(st); return; }
-    st.src = im; st.fw = fw; st.fh = fh; st.got = SBN; st.state = 'ready';
-    tlDraw();
-  };
-  im.onerror = () => { if (!st.dead) { st.im = null; storyGen(st); } };     // на сервере нет — делаем сами
-  im.src = q('/s/' + st.f.id + '?v=' + Math.round(st.f.mtime || 0));
-}
-
-// ждать событие скрытого <video>; st.rej позволяет оборвать ожидание при отмене
-function waitVid(st, v, ev, ms) {
-  return new Promise((res, rej) => {
-    let tm = 0;
-    const fin = err => {
-      clearTimeout(tm);
-      v.removeEventListener(ev, ok);
-      v.removeEventListener('error', bad);
-      if (st.rej === abort) st.rej = null;
-      if (err) rej(err); else res();
-    };
-    const ok = () => fin(null);
-    const bad = () => fin(new Error('video error'));
-    const abort = () => fin(new Error('aborted'));
-    tm = setTimeout(() => fin(new Error('timeout')), ms);
-    st.rej = abort;
-    v.addEventListener(ev, ok, {once: true});
-    v.addEventListener('error', bad, {once: true});
-  });
-}
-
-function storyRelease(st) {
-  const v = st.vid;
-  if (!v) return;
-  st.vid = null;
-  v.removeAttribute('src');
-  try { v.load(); } catch (_) { /* нечего освобождать */ }
-}
-
-async function storyGen(st) {
-  if (st.dead) return;
-  st.state = 'gen';
-  const f = st.f;
-  const v = document.createElement('video');
-  v.muted = true;
-  v.preload = 'metadata';
-  v.playsInline = true;
-  st.vid = v;
-  try {
-    const meta = waitVid(st, v, 'loadedmetadata', 15000);
-    v.src = fUrl(f.id);
-    await meta;
-    const dur = v.duration, vw = v.videoWidth, vh = v.videoHeight;
-    if (!isFinite(dur) || dur <= 0 || !vw || !vh) throw new Error('no video');
-    let fh = Math.round(SBW * vh / vw);
-    fh += fh & 1;                                       // высота кадра чётная
-    const c = document.createElement('canvas');
-    c.width = SBW * SBC; c.height = fh * SBR;
-    const x = c.getContext('2d');
-    x.imageSmoothingQuality = 'high';
-    st.src = c; st.fw = SBW; st.fh = fh; st.got = 0;
-    for (let i = 0; i < SBN; i++) {
-      if (st.dead) return;
-      const w = waitVid(st, v, 'seeked', 10000);
-      v.currentTime = dur * (i + 0.5) / SBN;
-      await w;
-      if (st.dead) return;
-      x.drawImage(v, (i % SBC) * SBW, Math.floor(i / SBC) * fh, SBW, fh);
-      st.got = i + 1;
-      tlFrame(st, i);
+    try {
+      st.task = storyGet(f, s => {
+        if (st !== ST || st.dead) return;
+        st.src = s.src; st.fw = s.fw; st.fh = s.fh; st.got = s.got; st.state = s.state;
+        tlFrame(st, s.got - 1);             // таймлайн заполняется, как раньше, по одному кадру
+      });
+      const s = await st.task;
+      if (st !== ST || st.dead) return;
+      Object.assign(st, s);
+      tlDraw();
+    } catch (_) {
+      if (!st.dead) st.state = 'fail';      // частично готовый таймлайн остаётся видимым
     }
-    st.state = 'ready';
-    storyRelease(st);
-    // toDataURL, а не toBlob (см. canvasBlob)
-    const blob = dataBlob(c.toDataURL('image/jpeg', 0.8));
-    fetch(q('/api/story/' + f.id), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob}).catch(() => {});
-  } catch (e) {
-    if (!st.dead) st.state = 'fail';                    // тихо: что успели — остаётся
-  } finally {
-    storyRelease(st);
-  }
+  }, delay || 0);
 }
 
 function storyStop() {
@@ -709,9 +636,7 @@ function storyStop() {
   ST = null;
   st.dead = true;
   clearTimeout(st.tm);
-  if (st.rej) st.rej();
-  if (st.im) { st.im.onload = st.im.onerror = null; st.im.src = ''; st.im = null; }
-  storyRelease(st);
+  if (st.task) st.task.cancel();
 }
 
 /* ───── таймлайн: полоса из 30 кадров над панелью ───── */
