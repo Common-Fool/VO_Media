@@ -1,1 +1,47 @@
 /* VO Media — стили сетки, дерева, меню, поиска (новые правила; app.css не трогать — переопределять здесь). */
+
+/* поиск, режимы, кнопки шапки */
+#qs{width:190px;padding:5px 10px;font:inherit;color:var(--text);background:#0d0e12;border:1px solid var(--line2);border-radius:var(--r)}
+#qs:focus{outline:none;border-color:var(--acc)}
+#flatb.on,#newb.on{border-color:var(--acc);background:#25223a}
+#favb{padding:3px 9px;font-size:15px}
+#xplb,#more{flex:none;padding:3px 10px;font-size:13px}
+#xplb svg{width:15px;height:15px}
+#newp{position:fixed;z-index:30;width:220px;padding:6px;border:1px solid var(--line2);border-radius:12px;background:#1a1c23;box-shadow:0 14px 40px #000b}
+#newp button{display:block;width:100%;padding:8px 10px;text-align:left;background:none;border:0;border-radius:7px}
+#newp button:hover{background:var(--ctlh)}
+#mrate .ck{display:inline-block;width:18px;color:var(--ok)}
+#mrate.on .ck::before{content:'✓'}
+#mplr,#mrate{display:block}
+
+/* полоска «досмотрено» */
+.wb{position:absolute;left:0;right:0;bottom:0;height:4px;background:#0009;pointer-events:none}
+.wb i{display:block;height:100%;background:var(--accg)}
+.wb.done i{background:var(--ok)}
+.sub.path{color:#9aa0b8}
+
+/* избранное в дереве */
+#favs{margin:0 0 8px;padding:0 0 8px;border-bottom:1px solid var(--line);max-height:30vh;overflow:auto}
+#favs .ph2{margin:2px 8px 4px}
+.fv .fst{flex:none;width:14px;text-align:center;color:#f0c24b;font-size:12px}
+
+/* контекстное меню */
+#ctxm{position:fixed;z-index:80;min-width:210px;padding:5px;border:1px solid var(--line2);border-radius:10px;background:#1a1c23;box-shadow:0 14px 40px #000c}
+#ctxm hr{margin:4px 6px;border:0;border-top:1px solid var(--line)}
+#ctxm .crow2{display:flex;align-items:stretch}
+#ctxm .crow2 button{flex:1;padding:6px 10px;text-align:left;background:none;border:0;border-radius:6px}
+#ctxm .crow2 button.gear{flex:none;padding:6px 8px;color:var(--dim)}
+#ctxm .crow2 button:hover{background:var(--ctlh)}
+
+/* поле в диалоге (переименование) */
+#dinp{width:100%;margin:0 0 18px;padding:7px 10px;font:inherit;color:var(--text);background:#0d0e12;border:1px solid var(--line2);border-radius:var(--r)}
+#dinp:focus{outline:none;border-color:var(--acc)}
+
+/* окно выбора плеера */
+#pll{display:flex;flex-direction:column;gap:6px;margin:0 0 16px;max-height:50vh;overflow:auto}
+#pll button{display:flex;align-items:center;gap:12px;padding:9px 12px;text-align:left;border-radius:10px}
+#pll button.on{border-color:var(--acc);background:#25223a}
+#pll .rd{width:16px;height:16px;flex:none;border:2px solid var(--line2);border-radius:50%}
+#pll button.on .rd{border:5px solid var(--acc)}
+#pll .pn{flex:1;min-width:0}
+#pll .pn span{display:block;font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

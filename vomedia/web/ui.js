@@ -4,18 +4,35 @@
 
 /* ───── окна и диалоги ───── */
 
-function ask(text, okLabel) {
+// inp (строка) — в диалоге поле ввода с этим значением; ответ — введённый текст или null
+function ask(text, okLabel, inp) {
   return new Promise(res => {
-    const d = $('#dlg');
+    const d = $('#dlg'), box = $('#dinp'), withInp = typeof inp === 'string';
     $('#dtxt').textContent = text;
     $('#dok').textContent = okLabel || 'Continue';
+    box.hidden = !withInp;
     d.hidden = false;
-    $('#dok').focus();
-    const done = v => { d.hidden = true; ask.cancel = null; res(v); };
-    $('#dok').onclick = () => done(true);
-    $('#dno').onclick = () => done(false);
-    ask.cancel = () => done(false);
+    if (withInp) {
+      box.value = inp;
+      box.focus();
+      const dot = inp.lastIndexOf('.');
+      box.setSelectionRange(0, dot > 0 ? dot : inp.length);      // имя без расширения
+      box.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); $('#dok').click(); } };
+    } else {
+      $('#dok').focus();
+    }
+    const done = v => { d.hidden = true; box.hidden = true; box.onkeydown = null; ask.cancel = null; res(v); };
+    $('#dok').onclick = () => done(withInp ? box.value : true);
+    $('#dno').onclick = () => done(withInp ? null : false);
+    ask.cancel = () => done(withInp ? null : false);
   });
+}
+
+/* ───── вызов файловых действий сервера ───── */
+
+// POST; ошибка — toast («Not available yet», если маршрута ещё нет), ответ null
+async function apiAct(path, body) {
+  try { return await post(path, body); } catch (e) { toast(errText(e), true); return null; }
 }
 
 function sheet(id) {
@@ -30,6 +47,114 @@ function closeSheet() { $('#ov').hidden = true; }
 function closePanels() {
   $('#menup').hidden = true;
   $('#rootp').hidden = true;
+  $('#newp').hidden = true;
+  ctxClose();
+}
+
+/* ───── выбор видеоплеера (окно как #plp в VSPO) ───── */
+
+const PL = {data: null, name: ''};
+function plKeep(d) {
+  PL.data = d;
+  PL.name = (d && d.current && d.current.name) || '';
+}
+async function loadPlayer() {
+  try { plKeep(await getJson(q('/api/player'))); } catch (e) { /* маршрута может ещё не быть */ }
+}
+function plRender() {
+  const d = PL.data;
+  $('#pll').innerHTML = (d.players || []).map((x, i) => '<button data-i="' + i + '" class="' + (x.current ? 'on' : '') + '">' +
+    '<span class="rd"></span><span class="pn">' + esc(x.name) + '<span>' + esc(x.path || 'System default') + '</span></span></button>').join('') ||
+    '<span class="dim">No players found</span>';
+}
+async function playerSheet() {
+  try { plKeep(await getJson(q('/api/player'))); } catch (e) { toast(errText(e), true); return; }
+  plRender();
+  sheet('plp');
+}
+
+/* ───── контекстное меню (G1) ───── */
+
+function ctxClose() {
+  const m = $('#ctxm');
+  if (m && !m.hidden) { m.hidden = true; m.textContent = ''; }
+}
+function showCtxMenu(x, y, item) {
+  if (!item) return;
+  closePanels();
+  const m = $('#ctxm');
+  m.textContent = '';
+  const add = (label, fn, o) => {
+    o = o || {};
+    if (o.sep) m.append(document.createElement('hr'));
+    const row = document.createElement('div');
+    row.className = 'crow2';
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => { ctxClose(); fn(); };
+    row.append(b);
+    if (o.gear) {
+      const g = document.createElement('button');
+      g.className = 'gear';
+      g.title = 'Choose the video player';
+      g.textContent = '⚙';
+      g.onclick = () => { ctxClose(); playerSheet(); };
+      row.append(g);
+    }
+    m.append(row);
+    return b;
+  };
+  if (item.type === 'file' && item.f) {
+    const f = item.f;
+    if (!V.open) add('Open', () => openViewer(f));
+    const pb = add('Play in ' + (PL.name || 'player'), async () => {
+      if (await apiAct('/api/play', {ids: [f.id]})) toast('Sent to the player');
+    }, {gear: true});
+    if (!PL.data) loadPlayer().then(() => { if (!m.hidden && PL.name) pb.textContent = 'Play in ' + PL.name; });
+    add('Show in Explorer', () => apiAct('/api/explorer', {id: f.id}));
+    if (!V.open && (MODE === 'search' || MODE === 'new') && f.rel != null) {
+      add('Go to folder', () => {
+        if (S.flat) { setS('flat', false); syncModeUi(); }
+        openDir(f.rel, {select: 'f:' + f.id});
+      });
+    }
+    add('Rename…', () => renameFile(f), {sep: true});
+    add('Copy', async () => { if (await apiAct('/api/file/copy', {ids: [f.id], what: 'files'})) toast('Copied'); });
+    add('Copy path', async () => { if (await apiAct('/api/file/copy', {ids: [f.id], what: 'path'})) toast('Path copied'); });
+    add('Delete…', () => deleteFile(f), {sep: true});
+  } else if (item.type === 'dir' && item.d) {
+    const d = item.d, rel = normRel(d.rel);
+    if (!V.open) add('Open', () => openDir(rel));
+    add('Show in Explorer', () => apiAct('/api/explorer', {rel: rel}));
+    if (rel) add(S.fav.indexOf(rel) >= 0 ? 'Remove from favourites' : 'Add to favourites', () => favToggle(rel));
+    add('Copy path', async () => { if (await apiAct('/api/file/copy', {rel: rel, what: 'path'})) toast('Path copied'); });
+  } else {
+    return;
+  }
+  m.hidden = false;
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 6)) + 'px';
+  m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 6)) + 'px';
+}
+
+async function renameFile(f) {
+  const name = await ask('Rename ' + f.name, 'Rename', f.name);
+  if (name == null) return;
+  const nn = name.trim();
+  if (!nn || nn === f.name) return;
+  const r = await apiAct('/api/file/rename', {id: f.id, name: nn});
+  if (!r) return;
+  if (r.removed) { fileRemoved(f.id); toast('Renamed. It is not a media file, so it is no longer listed'); return; }
+  if (r.file) fileChanged(r.file);
+  toast('Renamed');
+}
+async function deleteFile(f) {
+  if (!await ask('Delete ' + f.name + '? On a NAS it goes to the share\'s recycle bin if it is enabled.', 'Delete')) return;
+  const r = await apiAct('/api/file/delete', {ids: [f.id]});
+  if (!r) return;
+  if ((r.deleted || []).indexOf(f.id) >= 0) { fileRemoved(f.id); toast('Deleted'); return; }
+  const er = (r.errors || [])[0];
+  toast('Not deleted' + (er && er.error ? ': ' + er.error : ''), true);
 }
 function togglePanel(id) {
   const el = $('#' + id), was = el.hidden;
@@ -217,6 +342,7 @@ function syncControls() {
   document.documentElement.style.setProperty('--tw', S.treeW + 'px');
   document.body.classList.toggle('notree', !S.tree);
   $('#rootn').textContent = rootName;
+  syncModeUi();
   $('#rootb').title = BOOT.root || '';
   $('#mver').textContent = (BOOT.app || 'VO Media') + ' ' + (BOOT.version || '');
 }
@@ -314,6 +440,80 @@ function wireControls() {
     }
   };
   $('#mkeys').onclick = () => sheet('keyp');
+  $('#mplr').onclick = playerSheet;
+  $('#mrate').onclick = () => { setS('rateUI', !S.rateUI); syncModeUi(); };
+  $('#plclose').onclick = closeSheet;
+  $('#pll').addEventListener('click', async e => {
+    const b = e.target.closest('button[data-i]');
+    if (!b || !PL.data) return;
+    const x = PL.data.players[+b.dataset.i];
+    if (!x || !await apiAct('/api/player/set', {id: x.id})) return;
+    await loadPlayer();
+    if (PL.data) plRender();
+  });
+  $('#plpick').onclick = async () => {
+    const r = await apiAct('/api/player/pick', {});
+    if (!r || !r.ok) return;
+    await loadPlayer();
+    if (PL.data) plRender();
+  };
+
+  // поиск, плоский вид, «Новое»
+  const qs = $('#qs');
+  qs.addEventListener('input', () => searchInput(false));
+  qs.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); searchInput(true); qs.blur(); }
+    else if (e.key === 'Escape') {
+      e.preventDefault();
+      clearTimeout(searchT);
+      qs.value = '';
+      qs.blur();
+      if (MODE === 'search') exitMulti();
+    } else if (e.key === 'ArrowDown') { e.preventDefault(); qs.blur(); }
+  });
+  $('#flatb').onclick = () => { setS('flat', !S.flat); syncModeUi(); openDir(curRel); };
+  $('#newb').onclick = () => {
+    togglePanel('newp');
+    $('#newp').style.left = Math.min($('#newb').getBoundingClientRect().left, innerWidth - 230) + 'px';
+  };
+  $('#newp').addEventListener('click', e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    closePanels();
+    if (b.dataset.since) openNew(b.dataset.since); else exitMulti();
+  });
+  $('#more').onclick = loadMore;
+  $('#xplb').onclick = () => apiAct('/api/explorer', {rel: curRel});
+  $('#favb').onclick = () => favToggle(curRel);
+  $('#favs').addEventListener('click', e => {
+    const row = e.target.closest('.fv');
+    if (row) openDir(row.dataset.rel);
+  });
+
+  // правый клик: плитки, дерево, избранное
+  $cells.addEventListener('contextmenu', e => {
+    const el = e.target.closest('.cell');
+    if (!el) return;
+    e.preventDefault();
+    const i = +el.dataset.i, it = list[i];
+    if (!it) return;
+    setSel(i, false);
+    showCtxMenu(e.clientX, e.clientY, i < nd ? {type: 'dir', d: it} : {type: 'file', f: it});
+  });
+  $('#tree').addEventListener('contextmenu', e => {
+    const row = e.target.closest('.tr');
+    if (!row) return;
+    e.preventDefault();
+    const rel = row.dataset.rel, n = T.get(rel);
+    showCtxMenu(e.clientX, e.clientY, {type: 'dir', d: {rel: rel, name: n && n.name ? n.name : baseName(rel)}});
+  });
+  // меню закрывается кликом мимо, прокруткой, сменой размера и потерей фокуса окна
+  document.addEventListener('mousedown', e => { if (!e.target.closest('#ctxm')) ctxClose(); }, true);
+  document.addEventListener('contextmenu', () => ctxClose(), true);
+  document.addEventListener('wheel', () => ctxClose(), {capture: true, passive: true});
+  addEventListener('scroll', () => ctxClose(), true);
+  addEventListener('resize', ctxClose);
+  addEventListener('blur', ctxClose);
   $('#kclose').onclick = closeSheet;
   $('#mcache').onclick = cacheOpen;
   $('#cclose').onclick = closeSheet;
@@ -324,7 +524,7 @@ function wireControls() {
   $('#ov').onclick = e => { if (e.target.id === 'ov') closeSheet(); };
   $('#idxs').onclick = () => indexCmd('/api/index/stop', {}, '');
   document.addEventListener('click', e => {
-    if (!e.target.closest('#rootp,#rootb,#menup,#menub')) closePanels();
+    if (!e.target.closest('#rootp,#rootb,#menup,#menub,#newp,#newb,#ctxm')) closePanels();
     const b = e.target.closest('button');
     if (b && !b.closest('#dlg') && !b.closest('#ov')) b.blur();     // чтобы Space/Enter не нажимали кнопку повторно
   });
@@ -336,11 +536,18 @@ document.addEventListener('keydown', e => {
     if (k === 'Escape' && ask.cancel) { e.preventDefault(); ask.cancel(); }
     return;
   }
+  if (k === 'Escape' && !$('#ctxm').hidden) { e.preventDefault(); ctxClose(); return; }
   if (!$('#ov').hidden) {
     if (k === 'Escape') { e.preventDefault(); closeSheet(); }
     return;
   }
-  if (k === 'Escape' && (!$('#menup').hidden || !$('#rootp').hidden)) { e.preventDefault(); closePanels(); return; }
+  if (k === 'Escape' && (!$('#menup').hidden || !$('#rootp').hidden || !$('#newp').hidden)) { e.preventDefault(); closePanels(); return; }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (k === 'f' || k === 'F') && !V.open) {
+    e.preventDefault();
+    $('#qs').focus();
+    $('#qs').select();
+    return;
+  }
   if (V.open) {
     if (viewerKey(e)) e.preventDefault();
     return;
@@ -364,6 +571,15 @@ function init() {
   $('#dirs').append(buildDom(root));
   loadKids(root).catch(() => {});
   pollIndex();
+  renderFavs();
+  loadPlayer();
+  // просмотрщик закрылся: обновить полоски «досмотрено» на плитках
+  let wasV = false;
+  new MutationObserver(() => {
+    const now = document.body.classList.contains('viewing');
+    if (wasV && !now) afterViewer();
+    wasV = now;
+  }).observe(document.body, {attributes: true, attributeFilter: ['class']});
   openDir(S.last || '');
 }
 

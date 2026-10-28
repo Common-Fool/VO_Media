@@ -1,1 +1,55 @@
 /* VO Media — стили просмотрщика (новые правила; app.css не трогать — переопределять здесь). */
+
+/* Поворот и зум применяются к самому фото, а не к чёрному фону окна. */
+#vstage{overflow:hidden}
+#v.photo #vi{inset:auto;left:50%;top:50%;max-width:none;max-height:none;background:transparent;
+  transform:translate(-50%,-50%);transform-origin:center;touch-action:none}
+#v.zoomed #vi{cursor:grab}
+#v.panning #vi{cursor:grabbing}
+#v.idle.photo #vi{cursor:none}
+
+/* Новые переключатели остаются доступны и при открытом фото или GIF. */
+#voptions{display:flex;align-items:center;gap:4px;flex:none}
+#voptions button,#vslide{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:32px;
+  padding:0 6px;background:#0008;border:1px solid #ffffff26;color:#fff;font-size:15px;line-height:1}
+#voptions button:hover,#vslide:hover{background:#ffffff22;border-color:#ffffff44}
+#voptions button.on,#vslide.on{color:var(--pick);border-color:#9d90ff77;background:#332953aa}
+#vctl #vrate{width:48px;font-size:13px;font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* Отдельная строка управления не перекрывает имя, сведения и время в центре. */
+#vrow{gap:6px 14px}
+#vrow #vname{flex:1 1 35%;min-width:100px;max-width:none}
+#vrow #vctl{flex:1 0 65%;justify-content:flex-end;min-width:0;flex-wrap:wrap}
+#vrow #voptions{margin-left:auto}
+/* время — по центру строки управления (просьба владельца) */
+#vrow #vctl{position:relative}
+#vrow #vtime{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);margin:0;min-width:96px}
+
+/* Полупрозрачная кнопка слайдшоу и шкала, появляющаяся при наведении. */
+#vslidebox{position:absolute;left:14px;top:14px;z-index:4;display:flex;align-items:center;gap:0;opacity:.72;
+  transition:opacity .15s}
+#vslidebox:hover,#vslidebox:focus-within{opacity:1}
+#vslide{width:42px;height:38px;border-radius:9px;font-size:18px}
+#vslidespeed{display:flex;align-items:center;gap:8px;width:0;max-width:calc(100vw - 130px);overflow:hidden;visibility:hidden;
+  padding:6px 0;border-radius:0 8px 8px 0;background:#000b;white-space:nowrap;color:#fff;pointer-events:none}
+#vslidebox:hover #vslidespeed,#vslidebox:focus-within #vslidespeed{width:190px;padding:6px 10px;visibility:visible;pointer-events:auto}
+#vslidespeed input{width:120px;min-width:40px;flex:1;accent-color:var(--acc);cursor:pointer}
+#vslidespeed span{min-width:34px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums}
+#v.idle #vslidebox{opacity:0;pointer-events:none}
+
+/* Ошибка видео и Restart — свои элементы, без системных диалогов. */
+#vfallback{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;display:flex;flex-direction:column;
+  align-items:center;gap:14px;max-width:calc(100% - 140px);padding:20px 24px;border:1px solid #ffffff30;border-radius:12px;
+  background:#111217ed;text-align:center;font-size:16px}
+#vfallback button{font-size:14px}
+#vmsg{z-index:2}
+#vmsg #vrestart{pointer-events:auto;margin-left:12px;padding:3px 10px;font-size:13px}
+@media(max-width:640px){
+  #vbar{padding-left:12px;padding-right:12px}
+  #vrow{gap:6px 10px}
+  #vrow #vsize{max-width:50%;overflow:hidden;text-overflow:ellipsis}
+  #vrow #vctl{flex-basis:100%;gap:6px}
+  #vvol{width:70px}
+  #vfallback{max-width:calc(100% - 100px);padding:16px}
+}
+@media(prefers-reduced-motion:reduce){#vslidebox{transition:none}}

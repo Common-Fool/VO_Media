@@ -45,6 +45,9 @@
     <option value="photo">Photos</option>
     <option value="video">Videos</option>
   </select>
+  <input id="qs" type="search" placeholder="Search names (Ctrl+F)" aria-label="Search file and folder names" autocomplete="off" spellcheck="false">
+  <button id="flatb" title="Show the files of this folder and all its subfolders in one grid">Subfolders</button>
+  <button id="newb" title="Files that appeared recently">New ▾</button>
   <label title="Tile size"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg><input id="sz" type="range" min="120" max="480" step="10" aria-label="Tile size"></label>
   <div id="vw" class="seg" title="How folders are shown">
     <button data-v="tiles">Tiles</button><button data-v="list">List</button>
@@ -54,6 +57,9 @@
 </header>
 <div id="sub">
   <nav id="crumbs" aria-label="Path"></nav>
+  <button id="favb" class="ib" title="Add this folder to favourites">☆</button>
+  <button id="xplb" class="ib" title="Show this folder in the file manager"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5A2.5 2.5 0 015.5 4H9l2 2.5h7.5A2.5 2.5 0 0121 9v8.5a2.5 2.5 0 01-2.5 2.5h-13A2.5 2.5 0 013 17.5z"/></svg>Show in Explorer</button>
+  <button id="more" hidden>Load more</button>
   <span id="busy" class="dim" hidden>Refreshing…</span>
   <span id="cnt" class="dim"></span>
 </div>
@@ -66,14 +72,24 @@
 <div id="menup" hidden>
   <button id="mupd">Update library</button>
   <button id="mfull">Full rescan</button>
+  <button id="mplr">Video player…</button>
+  <button id="mrate"><span class="ck"></span>Show speed control</button>
   <button id="mkeys">Keyboard shortcuts</button>
   <button id="mcache">Cache…</button>
   <hr>
   <div id="mver" class="ver"></div>
 </div>
 
+<div id="newp" hidden>
+  <button data-since="last">Since last launch</button>
+  <button data-since="7">Last 7 days</button>
+  <button data-since="30">Last 30 days</button>
+  <button id="newx" hidden>Leave the New view</button>
+</div>
+<div id="ctxm" hidden></div>
+
 <div id="wrap">
-  <aside id="tree"><nav id="dirs"></nav></aside>
+  <aside id="tree"><div id="favs" hidden></div><nav id="dirs"></nav></aside>
   <div id="split" title="Drag to resize"></div>
   <main id="main">
     <div id="scroll">
@@ -122,6 +138,12 @@
     <div id="cachec" class="cbox">Loading…</div>
     <div class="acts"><button id="cclose" class="go">Close</button></div>
   </div>
+  <div class="sheet" id="plp" hidden>
+    <h2>Video player</h2>
+    <p class="dim">The player used by “Play in …”. MPC-HC takes several files as a playlist; other players get the file.</p>
+    <div id="pll"></div>
+    <div class="acts"><button id="plpick">Choose another program…</button><button id="plclose" class="go">Close</button></div>
+  </div>
   <div class="sheet" id="keyp" hidden>
     <h2>Keyboard shortcuts</h2>
     <div class="keys">
@@ -132,7 +154,10 @@
       <span><kbd>Enter</kbd> <kbd>Space</kbd></span><span>Open: enter a folder or view a file</span>
       <span><kbd>Backspace</kbd> <kbd>Alt</kbd>+<kbd>↑</kbd></span><span>Up one level</span>
       <span><kbd>[</kbd> <kbd>]</kbd></span><span>Previous / next folder of the same level</span>
-      <span><kbd>F5</kbd></span><span>Reread the current folder from disk</span>
+      <span><kbd>F5</kbd></span><span>Reread the current folder from disk (in a search or the New view: run it again)</span>
+      <span><kbd>Ctrl</kbd>+<kbd>F</kbd></span><span>Search names in the whole library</span>
+      <span><kbd>Esc</kbd></span><span>In the search field, in search results or in the New view: back to the folder</span>
+      <span>Right click</span><span>Menu of a file, folder or tree row (open, play, rename, copy, delete, favourites)</span>
       <h3>Viewer</h3>
       <span><kbd>←</kbd> <kbd>→</kbd></span><span>Previous / next file (past the last or first file: the next / previous folder)</span>
       <span><kbd>Home</kbd> <kbd>End</kbd></span><span>First / last file</span>
@@ -142,6 +167,12 @@
       <span><kbd>Ctrl</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 30 s</span>
       <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd></span><span>Seek 2 min</span>
       <span><kbd>T</kbd></span><span>Timeline with video frames on / off</span>
+      <span><kbd>Shift</kbd>+<kbd>,</kbd> <kbd>Shift</kbd>+<kbd>.</kbd></span><span>Slower / faster playback (0.5× to 2×)</span>
+      <span><kbd>,</kbd> <kbd>.</kbd></span><span>On pause: one frame back / forward</span>
+      <span><kbd>Z</kbd></span><span>Photo: fit the window / 100 %</span>
+      <span><kbd>R</kbd></span><span>Photo: rotate 90° (display only)</span>
+      <span><kbd>Ctrl</kbd>+Mouse wheel</span><span>Photo: zoom to the cursor; drag to move</span>
+      <span>Buttons in the bar</span><span>Autoplay, next video at the end, loop video, speed (if enabled in the menu); top left: slideshow, hover for its interval</span>
       <span><kbd>↑</kbd> <kbd>↓</kbd></span><span>Volume</span>
       <span><kbd>M</kbd></span><span>Mute</span>
       <span><kbd>I</kbd></span><span>Show / hide the bottom bar</span>
@@ -157,6 +188,7 @@
 <div id="dlg" hidden>
   <div class="box">
     <p id="dtxt"></p>
+    <input id="dinp" type="text" hidden spellcheck="false" autocomplete="off">
     <div class="acts"><button id="dno">Cancel</button><button id="dok" class="go">Continue</button></div>
   </div>
 </div>

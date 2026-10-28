@@ -50,15 +50,23 @@ function toast(msg, bad) {
 async function getJson(url, signal, opt) {
   const r = await fetch(url, Object.assign({signal: signal}, opt));
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || 'error ' + r.status);
+  if (!r.ok) {
+    const e = new Error(j.error || 'error ' + r.status);
+    e.status = r.status;            // по коду страница отличает «маршрута ещё нет» от обычной ошибки
+    e.noBody = !j.error;
+    throw e;
+  }
   return j;
 }
+// сервер (или files.py) ещё не умеет такой запрос: 501 или 404 без осмысленного текста ошибки
+const isNA = e => !!e && (e.status === 501 || (e.status === 404 && (e.noBody || /^(not found|unknown|no route)/i.test(e.message))));
+const errText = e => isNA(e) ? 'Not available yet' : (e && e.message) || 'error';
 const post = (path, body) => getJson(q(path), undefined, {
   method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
 
 /* ───── настройки папки (хранит сервер) ───── */
 
-const DEF = {sort: 'name', desc: false, filter: 'all', view: 'tiles', tile: 220, tree: true, treeW: 280, last: '', volume: 0.8, muted: false, timeline: false};
+const DEF = {sort: 'name', desc: false, filter: 'all', view: 'tiles', tile: 220, tree: true, treeW: 280, last: '', volume: 0.8, muted: false, timeline: false, flat: false, fav: []};
 const S =Object.assign({}, DEF, BOOT.settings || {});
 if (['name', 'date', 'size', 'duration'].indexOf(S.sort) < 0) S.sort = 'name';
 if (['all', 'photo', 'video'].indexOf(S.filter) < 0) S.filter = 'all';
@@ -68,6 +76,10 @@ S.treeW = clamp(+S.treeW || 280, 160, 600);
 S.volume = clamp(+S.volume, 0, 1);
 if (isNaN(S.volume)) S.volume = 0.8;
 S.last = normRel(S.last);
+S.flat = S.flat === true;
+S.rateUI = S.rateUI === true;
+// избранные папки: массив уникальных непустых относительных путей
+S.fav = Array.isArray(S.fav) ? S.fav.filter(x => typeof x === 'string').map(normRel).filter((x, i, a) => x && a.indexOf(x) === i).slice(0, 200) : [];
 
 let saveTimer = 0, frozen = false;
 function saveNow() {
@@ -91,6 +103,9 @@ let $scroll = null, $sizer = null, $cells = null;
 let D = null;                       // данные текущей папки (ответ /api/dir)
 let curRel = '';
 let navSeq = 0, applyN = 0, dirAbort = null;
+// режим списка: 'dir' — одна папка; 'search' / 'flat' / 'new' — файлы из многих папок (см. grid.js)
+let MODE = 'dir';
+const M = {q: '', since: 'last', loading: false, truncated: false, total: 0, userSort: false, items: [], busy: false, retry: 0, abort: null, dseq: 0};
 let reading = false;                // идёт чтение папки с диска
 let dirs = [], files = [], list = [], nd = 0, nf = 0, filesSize = 0;
 const keyIdx = new Map();           // ключ плитки → номер в list
@@ -147,8 +162,9 @@ function buildLists() {
   const ff = D ? (D.files || []) : [];
   const fl = S.filter === 'all' ? ff.slice() : ff.filter(f => f.kind === S.filter);
   const dl = dd.slice();
-  dl.sort(dirCmp());
-  fl.sort(fileCmp());
+  if (MODE !== 'flat') dl.sort(dirCmp());
+  // плоский вид отсортирован сервером (порциями); «Новое» — по времени появления, пока сортировку не меняли
+  if (MODE === 'search' || MODE === 'dir' || (MODE === 'new' && M.userSort)) fl.sort(fileCmp());
   dirs = dl; files = fl; nd = dl.length; nf = fl.length;
   list = dl.concat(fl);
   keyIdx.clear();

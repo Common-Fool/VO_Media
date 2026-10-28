@@ -71,6 +71,7 @@ function update() {
   for (const r of rr) for (let i = r[0]; i < r[1]; i++) if (!mounted.has(i)) add.push(i);
   if (add.length) mountAll(add);
   pump();
+  if (MODE === 'flat' && M.items.length < M.total && $scroll.scrollTop + $scroll.clientHeight > G.top + G.total - G.rowH * 6) loadMore();
 }
 
 function unmount(i, el) {
@@ -154,11 +155,38 @@ function fileHtml(f, i, st, sel) {
   const vid = f.kind === 'video';
   let sub = fmtSize(f.size);
   if (f.w && f.h) sub += ' · ' + f.w + '×' + f.h;
+  // в режимах «из многих папок» вместо даты — папка файла
+  const multi = MODE !== 'dir' && f.rel != null;
+  const sub2 = multi ? '<div class="sub path" title="' + esc(f.rel || rootName) + '">' + esc(shortRel(f.rel)) + '</div>'
+    : '<div class="sub">' + esc(fmtDate(f.mtime)) + '</div>';
   return '<div class="cell file' + sel + '" data-i="' + i + '" style="' + st + '"><div class="th"><div class="ph">' + (vid ? ICO_VID : ICO_PHOTO) +
     '</div><img alt="" decoding="async" loading="lazy"' + (src ? ' src="' + esc(src) + '"' : '') + '>' +
-    (vid ? '<span class="pl">' + ICO_PLAY + '</span>' + (f.duration != null ? '<span class="dur">' + fmtDur(f.duration) + '</span>' : '') : '') +
+    (vid ? '<span class="pl">' + ICO_PLAY + '</span>' + (f.duration != null ? '<span class="dur">' + fmtDur(f.duration) + '</span>' : '') : '') + wbHtml(f) +
     '</div><div class="cap"><div class="nm" title="' + esc(f.name) + '">' + esc(f.name) + '</div><div class="sub">' + esc(sub) +
-    '</div><div class="sub">' + esc(fmtDate(f.mtime)) + '</div></div></div>';
+    '</div>' + sub2 + '</div></div>';
+}
+// последние два сегмента пути папки
+function shortRel(rel) {
+  if (!rel) return rootName;
+  const a = rel.split('/');
+  return a.length > 2 ? '…/' + a.slice(-2).join('/') : rel;
+}
+// полоска «досмотрено» внизу плитки видео (GIF не считается)
+function wbHtml(f) {
+  if (f.kind !== 'video' || isGif(f) || typeof f.pos !== 'number' || !(f.duration > 0)) return '';
+  const k = clamp(f.pos / f.duration, 0, 1);
+  return '<span class="wb' + (k >= 1 ? ' done' : '') + '"><i style="width:' + (k * 100).toFixed(1) + '%"></i></span>';
+}
+function refreshWatched() {
+  for (const [i, el] of mounted) {
+    if (i < nd || !list[i]) continue;
+    const th = el.querySelector('.th');
+    if (!th) continue;
+    const old = th.querySelector('.wb');
+    if (old) old.remove();
+    const h = wbHtml(list[i]);
+    if (h) th.insertAdjacentHTML('beforeend', h);
+  }
 }
 
 function setTileImg(el, url) {
@@ -233,6 +261,7 @@ function openItem(i) {
   if (i < nd) openDir(it.rel); else openViewer(it);
 }
 function upLevel() {
+  if (MODE === 'search' || MODE === 'new') { exitMulti(); return; }
   if (!curRel) return;
   openDir(parentOf(curRel), {select: 'd:' + curRel});
 }
@@ -272,7 +301,11 @@ function gridKey(e) {
     case 'Backspace': upLevel(); return true;
     case '[': siblingDir(-1); return true;
     case ']': siblingDir(1); return true;
-    case 'F5': openDir(curRel, {mode: 'fresh'}); return true;
+    case 'Escape': if (MODE === 'search' || MODE === 'new') { exitMulti(); return true; } return false;
+    case 'F5':
+      if (MODE === 'search') { if (M.q) runSearch(M.q); } else if (MODE === 'new') openNew(M.since);
+      else openDir(curRel, {mode: 'fresh'});
+      return true;
     default: return false;
   }
 }
@@ -386,9 +419,9 @@ async function runTask(f) {
     t.rej(new Error('aborted'));
   };
   gen.run.set(f.id, t);
-  const to = setTimeout(() => { t.timedOut = true; t.cancel(); }, f.kind === 'video' ? 20000 : 60000);
+  const to = setTimeout(() => { t.timedOut = true; t.cancel(); }, f.kind === 'video' && !isGif(f) ? 20000 : 60000);
   try {
-    const blob = await (f.kind === 'video' ? makeVideoThumb(f, t) : makePhotoThumb(f, t));
+    const blob = await (f.kind === 'video' && !isGif(f) ? makeVideoThumb(f, t) : makePhotoThumb(f, t));
     if (t.aborted) return;
     const r = await fetch(q('/api/thumb/' + f.id), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
     if (!r.ok) throw new Error('upload ' + r.status);
@@ -440,6 +473,10 @@ function showBusy(on) { $('#busy').hidden = !on; }
 async function openDir(rel, o) {
   o = o || {};
   rel = normRel(rel);
+  clearTimeout(searchT);
+  $('#qs').value = '';
+  if (S.flat) return openFlat(rel, o);
+  if (MODE !== 'dir') leaveMulti();
   const mode = o.mode || 'both';
   const seq = ++navSeq;
   if (dirAbort) dirAbort.abort();
@@ -502,7 +539,7 @@ async function openDir(rel, o) {
 
 // тихо обновить цифры из кеша (после конца индексации)
 async function reloadCached() {
-  if (!D) return;
+  if (!D || MODE !== 'dir') return;
   const seq = navSeq, n = applyN, rel = curRel;
   try {
     const j = await getJson(dirUrl(rel, false));
@@ -531,6 +568,7 @@ function applyDir(d, o) {
   renderCrumbs();
   updCounts();
   updateMsg();
+  syncModeUi();
   if (!d._skel) syncTree(d);
   if (!o.keep) revealTree(d.rel, navSeq);
 }
@@ -551,6 +589,12 @@ function renderCrumbs() {
     if (!last) b.dataset.rel = rel;
     frag.append(b);
   };
+  if (MODE === 'search' || MODE === 'new') {
+    add(curRel, '← ' + (curRel ? baseName(curRel) : rootName), false);
+    add('', MODE === 'search' ? 'Search: “' + M.q + '”' : M.label, true);
+    el.replaceChildren(frag);
+    return;
+  }
   for (const p of (D.parents || [])) add(p.rel, p.rel === '' ? rootName : p.name, false);
   add(D.rel, D.rel === '' ? rootName : D.name, true);
   el.replaceChildren(frag);
@@ -559,6 +603,14 @@ function renderCrumbs() {
 
 function updCounts() {
   const parts = [];
+  if (MODE !== 'dir') {
+    if (nd) parts.push(plural(nd, 'folder', 'folders'));
+    if (MODE === 'flat' && nf < M.total) parts.push('Showing ' + fmtNum(nf) + ' of ' + fmtNum(M.total) + ' files');
+    else if (nf || !nd) parts.push(plural(nf, 'file', 'files') + (M.truncated ? '+' : '') + (nf ? ' · ' + fmtSize(filesSize) : ''));
+    if (MODE === 'new' && M.total > nf) parts.push('of ' + fmtNum(M.total));
+    $('#cnt').textContent = parts.join(' · ');
+    return;
+  }
   if (nd) parts.push(plural(nd, 'folder', 'folders'));
   if (nf) parts.push(plural(nf, 'file', 'files') + ' · ' + fmtSize(filesSize));
   $('#cnt').textContent = parts.join(' · ');
@@ -571,7 +623,11 @@ function setMsg(t) {
 }
 function updateMsg() {
   let t = '';
-  if (!list.length) {
+  if (!list.length && MODE !== 'dir') {
+    if (M.loading) t = MODE === 'search' ? 'Searching…' : 'Loading…';
+    else if (D && D.files.length) t = 'Nothing matches the filter';
+    else t = MODE === 'search' ? 'Nothing found' : MODE === 'new' ? 'No new files' : 'No files';
+  } else if (!list.length) {
     if (!D || (reading && (D._skel || D.listed == null))) t = 'Reading folder…';
     else if (D.files.length || D.dirs.length) t = 'Nothing matches the filter';
     else t = 'This folder is empty';
@@ -580,6 +636,8 @@ function updateMsg() {
 }
 
 function resort() {
+  if (MODE === 'flat') { openFlat(curRel); return; }   // порядок задаёт сервер
+  if (MODE === 'new') M.userSort = true;
   buildLists();
   clearMounted();
   layout();
@@ -728,4 +786,285 @@ function syncTree(d) {
   for (const x of (d.dirs || [])) { np += x.n_photo; nv += x.n_video; sz += x.size; }
   n.np = np; n.nv = nv; n.size = sz;
   setKids(n, d.dirs || []);
+}
+
+/* ───── режимы «файлы из многих папок»: поиск, плоский вид, «Новое» ───── */
+
+const curMode = () => MODE;
+let searchT = 0;
+
+// данные в форме ответа /api/dir, чтобы buildLists/сетка работали без изменений
+function multiData(rel, fl, dl) {
+  const d = skeleton(rel);
+  d._skel = false;
+  d._multi = true;
+  d.listed = 1;
+  d.files = fl;
+  d.dirs = dl || [];
+  return d;
+}
+function applyMulti(d, keep) {
+  pendingApply = null;
+  applyN++;
+  const st = $scroll.scrollTop;
+  D = d;
+  if (!keep) { selKey = ''; revokeObjs(); }
+  buildLists();
+  clearMounted();
+  layout();
+  $scroll.scrollTop = keep ? st : 0;
+  update();
+  renderCrumbs();
+  updCounts();
+  updateMsg();
+  syncModeUi();
+}
+// перерисовать текущие данные (после переименования/удаления), прокрутка и выбор сохраняются
+function rerender() {
+  if (!D) return;
+  const st = $scroll.scrollTop;
+  buildLists();
+  clearMounted();
+  layout();
+  $scroll.scrollTop = st;
+  update();
+  updCounts();
+  updateMsg();
+}
+// начать переход в другой режим: отменить прежние запросы, вернуть свежий номер
+function multiBegin() {
+  const seq = ++navSeq;
+  if (dirAbort) dirAbort.abort();
+  if (M.abort) M.abort.abort();
+  const ac = dirAbort = M.abort = new AbortController();
+  reading = false;
+  showBusy(false);
+  return {seq: seq, ac: ac};
+}
+function leaveMulti() {
+  MODE = 'dir';
+  M.q = ''; M.loading = false; M.truncated = false; M.total = 0; M.items = []; M.userSort = false;
+  if (M.abort) M.abort.abort();
+  D = null;
+  syncModeUi();
+}
+function exitMulti() { openDir(curRel); }
+
+function syncModeUi() {
+  const multi = MODE === 'search' || MODE === 'new';
+  const fav = S.fav.indexOf(curRel) >= 0;
+  $('#flatb').classList.toggle('on', !!S.flat);
+  $('#newb').classList.toggle('on', MODE === 'new');
+  $('#newx').hidden = MODE !== 'new';
+  $('#xplb').hidden = multi;
+  $('#favb').hidden = multi || !curRel;
+  $('#favb').textContent = fav ? '★' : '☆';
+  $('#favb').title = fav ? 'Remove this folder from favourites' : 'Add this folder to favourites';
+  $('#more').hidden = !(MODE === 'flat' && M.items.length < M.total);
+  $('#mrate').classList.toggle('on', !!S.rateUI);
+}
+
+/* поиск */
+
+function searchInput(now) {
+  clearTimeout(searchT);
+  const v = $('#qs').value.trim();
+  if (!v) { if (MODE === 'search') exitMulti(); return; }
+  searchT = setTimeout(() => runSearch(v), now ? 0 : 300);
+}
+async function runSearch(text) {
+  const first = MODE !== 'search';
+  const b = multiBegin();
+  MODE = 'search';
+  M.q = text; M.loading = true; M.truncated = false; M.userSort = false;
+  if (first) applyMulti(multiData(curRel, [], []));
+  else { showBusy(true); renderCrumbs(); }
+  try {
+    const j = await getJson(q('/api/search?q=' + encodeURIComponent(text) + '&limit=500'), b.ac.signal);
+    if (b.seq !== navSeq) return;
+    showBusy(false);
+    M.loading = false;
+    M.truncated = !!j.truncated;
+    applyMulti(multiData(curRel, j.files || [], j.dirs || []));
+  } catch (e) {
+    if (b.seq !== navSeq || e.name === 'AbortError') return;
+    showBusy(false);
+    toast(errText(e), true);
+    exitMulti();
+  }
+}
+
+/* плоский вид: все файлы папки и подпапок, порциями по 5000 */
+
+const FLAT_PAGE = 5000;
+const flatPage = (rel, offset, signal) => getJson(q('/api/flat?rel=' + encodeURIComponent(rel) + '&sort=' + S.sort + '&desc=' + (S.desc ? 1 : 0) +
+  '&filter=' + S.filter + '&offset=' + offset + '&limit=' + FLAT_PAGE), signal);
+
+async function openFlat(rel, o) {
+  rel = normRel(rel);
+  const b = multiBegin();
+  MODE = 'flat';
+  M.q = ''; M.items = []; M.total = 0; M.truncated = false; M.loading = true; M.busy = true; M.retry = 0;
+  curRel = rel;
+  setS('last', rel);
+  document.title = (rel ? baseName(rel) : rootName) + ' – VO Media';
+  applyMulti(multiData(rel, M.items, []));
+  revealTree(rel, b.seq);
+  try {
+    const j = await flatPage(rel, 0, b.ac.signal);
+    if (b.seq !== navSeq) return;
+    for (const f of (j.files || [])) M.items.push(f);
+    M.total = Math.max(+j.total || 0, M.items.length);
+  } catch (e) {
+    if (b.seq !== navSeq || e.name === 'AbortError') return;
+    M.loading = false; M.busy = false;
+    toast(errText(e), true);
+    setS('flat', false);
+    syncControls();
+    openDir(rel);
+    return;
+  }
+  M.loading = false; M.busy = false;
+  applyMulti(multiData(rel, M.items, []));
+}
+async function loadMore() {
+  if (MODE !== 'flat' || M.busy || V.open || M.items.length >= M.total || Date.now() < M.retry) return;
+  const seq = navSeq, signal = M.abort ? M.abort.signal : undefined;
+  M.busy = true;
+  showBusy(true);
+  try {
+    const j = await flatPage(curRel, M.items.length, signal);
+    if (seq !== navSeq) return;
+    const got = j.files || [];
+    if (!got.length) M.total = M.items.length;
+    for (const f of got) M.items.push(f);
+    if (D) D.files = M.items;
+    buildLists();
+    layout();                      // плитки впереди остаются на месте: порция дописана в конец
+    update();
+    updCounts();
+    updateMsg();
+    syncModeUi();
+  } catch (e) {
+    if (seq !== navSeq || e.name === 'AbortError') return;
+    M.retry = Date.now() + 5000;
+    toast(errText(e), true);
+  } finally {
+    if (seq === navSeq) { M.busy = false; showBusy(false); }
+  }
+}
+
+/* «Новое» */
+
+const NEW_LABELS = {last: 'New since last launch', '7': 'New in the last 7 days', '30': 'New in the last 30 days'};
+async function openNew(since) {
+  since = NEW_LABELS[since] ? since : 'last';
+  const b = multiBegin();
+  MODE = 'new';
+  M.since = since; M.label = NEW_LABELS[since]; M.q = ''; M.loading = true; M.truncated = false; M.userSort = false; M.total = 0;
+  $('#qs').value = '';
+  applyMulti(multiData(curRel, [], []));
+  try {
+    const j = await getJson(q('/api/new?since=' + since + '&limit=5000'), b.ac.signal);
+    if (b.seq !== navSeq) return;
+    M.loading = false;
+    M.total = +j.total || 0;
+    applyMulti(multiData(curRel, j.files || [], []));
+  } catch (e) {
+    if (b.seq !== navSeq || e.name === 'AbortError') return;
+    toast(errText(e), true);
+    exitMulti();
+  }
+}
+
+/* ───── общие функции для просмотрщика и меню ───── */
+
+// после закрытия просмотрщика: свежие полоски «досмотрено», отложенная перерисовка
+function afterViewer() {
+  if (M.dirty) { M.dirty = false; rerender(); } else refreshWatched();
+}
+
+// файл переименован (nf2 — объект файла из ответа сервера, тот же id)
+function fileChanged(nf2) {
+  if (!nf2 || !D) return;
+  const cur = byId.get(nf2.id) || (D.files || []).find(x => x.id === nf2.id);
+  if (!cur) return;
+  Object.assign(cur, nf2);
+  if (V.open) {
+    M.dirty = true;
+    const t = $('#vname');
+    if (t && V.list[V.i] && V.list[V.i].id === cur.id) t.textContent = cur.name;
+  } else {
+    rerender();
+  }
+}
+// файл удалён (или перестал быть медиа)
+function fileRemoved(id) {
+  const cut = d => {
+    if (!d || !d.files) return;
+    const i = d.files.findIndex(x => x.id === id);
+    if (i >= 0) d.files.splice(i, 1);
+  };
+  cut(D);
+  if (pendingApply) cut(pendingApply[0]);
+  if (MODE === 'flat') M.total = Math.max(0, M.total - 1);
+  gen.pending.delete(id);
+  const it = byId.get(id);
+  if (it && it._k === selKey) {
+    const n = list[it._i + 1] || list[it._i - 1];
+    selKey = n ? n._k : '';
+  }
+  if (V.open && typeof vFileRemoved === 'function') vFileRemoved(id);
+  rerender();
+  if (MODE === 'dir' && D && !D._skel) syncTree(D);
+}
+
+// миниатюры до 3 файлов другой папки; только когда очередь сетки ничего не делает
+let preRun = false;
+async function thumbPrefetch(fs) {
+  if (preRun) return;
+  const todo = (fs || []).slice(0, 3).filter(f => f && f.thumb !== 1 && !gen.failed.has(f.id) && !objUrl.has(f.id));
+  if (!todo.length) return;
+  preRun = true;
+  try {
+    for (const f of todo) {
+      if (gen.run.size) break;
+      const t = {aborted: false, clean: null, rej: null, abortP: null};
+      t.abortP = new Promise((_, rej) => { t.rej = rej; });
+      t.abortP.catch(() => {});
+      t.cancel = () => {
+        if (t.aborted) return;
+        t.aborted = true;
+        if (t.clean) t.clean();
+        t.rej(new Error('aborted'));
+      };
+      const to = setTimeout(t.cancel, 20000);
+      try {
+        const blob = await (f.kind === 'video' && !isGif(f) ? makeVideoThumb(f, t) : makePhotoThumb(f, t));
+        const r = await fetch(q('/api/thumb/' + f.id), {method: 'POST', headers: {'Content-Type': 'image/jpeg'}, body: blob});
+        if (r.ok) f.thumb = 1;
+      } catch (e) { /* не вышло — не страшно, плитка сделает сама */ }
+      finally { clearTimeout(to); if (t.clean) t.clean(); }
+    }
+  } finally {
+    preRun = false;
+  }
+}
+
+/* ───── избранные папки ───── */
+
+function favToggle(rel) {
+  rel = normRel(rel);
+  if (!rel) return;
+  const a = S.fav.slice(), i = a.indexOf(rel);
+  if (i >= 0) a.splice(i, 1); else a.push(rel);
+  setS('fav', a);
+  renderFavs();
+  syncModeUi();
+}
+function renderFavs() {
+  const box = $('#favs');
+  box.hidden = !S.fav.length;
+  box.innerHTML = S.fav.length ? '<div class="ph2">Favourites</div>' + S.fav.map(r =>
+    '<div class="tr fv" data-rel="' + esc(r) + '" title="' + esc(r) + '"><span class="fst">★</span><span class="tnm">' + esc(baseName(r)) + '</span></div>').join('') : '';
 }
