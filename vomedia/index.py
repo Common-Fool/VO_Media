@@ -485,8 +485,10 @@ class Library(object):
         files = [_file_obj(r) for r in c.execute(
             'SELECT ' + FCOLS + ' FROM files f LEFT JOIN progress p ON p.id=f.id WHERE f.dir=? ORDER BY f.name',
             (did,))]
+        # pending — файлы, у которых фоновый поток ещё не прочитал размеры/длительность: страница дочитает их опросом
+        pending = c.execute('SELECT COUNT(*) FROM files WHERE dir=? AND meta=0', (did,)).fetchone()[0]
         return {'rel': rel, 'name': name, 'listed': listed, 'mtime': mtime, 'parents': parents,
-                'dirs': self._dir_items(c, did), 'files': files}
+                'dirs': self._dir_items(c, did), 'files': files, 'pending': pending}
 
     def subdirs(self, rel):
         rel = self._norm(rel)

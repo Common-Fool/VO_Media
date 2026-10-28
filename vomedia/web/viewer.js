@@ -192,9 +192,12 @@ function vMetadata() {
     if (typeof f.pos === 'number' && f.pos > 10 && f.pos < dur - 10) {
       vSeekTo(f.pos);
       hud('Resumed at ' + fmtDur(f.pos));
+      // «Resumed» — маленькой плашкой внизу, сразу над панелью (или у края, если панель скрыта), на 2 с
+      $vmsg.classList.add('low');
+      $vmsg.style.bottom = ($v.classList.contains('nobar') ? 16 : $('#vbar').offsetHeight + 6) + 'px';
       $vrestart.hidden = false;
       clearTimeout(V.hudT);
-      V.hudT = setTimeout(() => { $vmsg.hidden = $vrestart.hidden = true; }, 5000);
+      V.hudT = setTimeout(() => { $vmsg.hidden = $vrestart.hidden = true; }, 2000);
     }
   }
   vUi();
@@ -276,6 +279,7 @@ function hud(text, sticky) {
   $vrestart.hidden = true;
   V.hudText.textContent = text;
   $vmsg.className = sticky ? 'err' : '';
+  $vmsg.style.bottom = '';
   $vmsg.hidden = false;
   if (!sticky) V.hudT = setTimeout(() => { $vmsg.hidden = true; }, 1200);
 }

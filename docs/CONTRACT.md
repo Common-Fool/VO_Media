@@ -203,7 +203,7 @@ def make_server(port: int, ctx) -> Server       # ctx — объект App из 
 |---|---|---|
 | GET | `/` | `web/index.html`, в нём заменить `/*BOOT*/{}` на JSON `{"token","app","version","root","rootName","settings","recent"}` |
 | GET | `/web/app.js`, `/web/app.css` | статика из папки `web` (рядом с модулем; в PyInstaller — `sys._MEIPASS/vomedia/web`) |
-| GET | `/api/dir?rel=` | `lib.list_dir(rel)`; нет в кеше → `{"rel": rel, "missing": true}` (страница сразу просит `fresh`) |
+| GET | `/api/dir?rel=` | `lib.list_dir(rel)`; нет в кеше → `{"rel": rel, "missing": true}` (страница сразу просит `fresh`); `pending` — сколько файлов папки ещё ждут чтения длительности/размеров (страница опрашивает кеш раз в 1,5 с, пока > 0: `metaWatch()`) |
 | GET | `/api/dir?rel=&fresh=1` | `lib.refresh_dir(rel)`, затем `list_dir`; плюс поле `"changed": bool`; `lib.prioritize(rel)` |
 | GET | `/api/tree?rel=` | `{"rel", "dirs": lib.subdirs(rel)}` |
 | GET | `/f/<id>` | файл; **Range** (`bytes=a-b`, `bytes=a-`, `bytes=-n`) → 206 + `Content-Range`; без Range → 200; `Accept-Ranges: bytes`; `Content-Type` по расширению; `Last-Modified`; чтение кусками по 1 МБ; нет файла → 404; неверный Range → 416 |

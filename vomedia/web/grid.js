@@ -818,6 +818,37 @@ function applyDir(d, o) {
   syncModeUi();
   if (!d._skel) syncTree(d);
   if (!o.keep) revealTree(d.rel, navSeq);
+  metaWatch();
+}
+
+// длительность и размеры кадра читает фоновый поток уже после показа папки: пока в ней есть
+// непрочитанные файлы (pending), опрашиваем кеш и дописываем значения в те же объекты
+let metaT = 0;
+function metaWatch() {
+  clearTimeout(metaT);
+  if (MODE === 'dir' && D && !D._skel && D.pending > 0) metaT = setTimeout(metaPoll, 1500);
+}
+async function metaPoll() {
+  if (MODE !== 'dir' || !D || D._skel) return;
+  const seq = navSeq, n = applyN, rel = D.rel;
+  let j;
+  try { j = await getJson(dirUrl(rel, false)); } catch (e) { metaWatch(); return; }
+  if (seq !== navSeq || n !== applyN || j.missing || !D || D.rel !== rel) return;
+  const nf = new Map(j.files.map(f => [f.id, f]));
+  if (nf.size !== D.files.length || D.files.some(f => !nf.has(f.id))) { applyDir(j, {keep: true}); return; }
+  let changed = false;
+  for (const f of D.files) {
+    const x = nf.get(f.id);
+    if (x.duration !== f.duration || x.w !== f.w || x.h !== f.h) { f.duration = x.duration; f.w = x.w; f.h = x.h; changed = true; }
+  }
+  D.pending = j.pending;
+  if (changed && !V.open) {
+    if (S.sort === 'duration') buildLists();
+    clearMounted();
+    layout();
+    update();
+  }
+  metaWatch();
 }
 
 function renderCrumbs() {
