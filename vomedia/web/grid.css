@@ -31,6 +31,9 @@
 .th.sb-show .dur{z-index:2}
 
 /* избранное в дереве */
+#tsh{position:sticky;top:-8px;z-index:2;display:flex;align-items:center;gap:6px;margin:-8px -6px 6px;padding:6px 8px;background:var(--panel);border-bottom:1px solid var(--line);font-size:12px;color:var(--dim)}
+#tsh span{flex:1;text-transform:uppercase;letter-spacing:.05em}
+#tsh select,#tsh button{padding:2px 6px;font-size:12px}
 #favs{margin:0 0 8px;padding:0 0 8px;border-bottom:1px solid var(--line);max-height:30vh;overflow:auto}
 #favs .ph2{margin:2px 8px 4px}
 .fv .fst{flex:none;width:14px;text-align:center;color:#f0c24b;font-size:12px}

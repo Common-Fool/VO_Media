@@ -484,5 +484,5 @@ Esc в HTML-полноэкранном режиме перехватывает �
 
 ## Настройки (добавляются к прежним)
 
-`autoplay` (false), `next` (false), `loop` (false), `slide` (0), `slideSec` (3), `rate` (1), `rateUI` (false), `flat` (false), `fav` ([]).
+`autoplay` (false), `next` (false), `loop` (false), `slide` (0), `slideSec` (3), `rate` (1), `rateUI` (false), `flat` (false), `fav` ([]), `tsort` ('name' | 'date' | 'size' | 'count' — своя сортировка веток дерева, над деревом), `tdesc` (false).
 Значения по умолчанию и проверку типов каждый исполнитель делает в своём файле при загрузке (`if (typeof S.x !== ...) S.x = ...`).

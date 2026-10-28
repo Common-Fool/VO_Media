@@ -66,9 +66,10 @@ const post = (path, body) => getJson(q(path), undefined, {
 
 /* ───── настройки папки (хранит сервер) ───── */
 
-const DEF = {sort: 'name', desc: false, filter: 'all', view: 'tiles', tile: 220, tree: true, treeW: 280, last: '', volume: 0.8, muted: false, timeline: false, flat: false, fav: []};
+const DEF = {sort: 'name', desc: false, filter: 'all', view: 'tiles', tile: 220, tree: true, treeW: 280, last: '', volume: 0.8, muted: false, timeline: false, flat: false, fav: [], tsort: 'name', tdesc: false};
 const S =Object.assign({}, DEF, BOOT.settings || {});
 if (['name', 'date', 'size', 'duration'].indexOf(S.sort) < 0) S.sort = 'name';
+if (['name', 'date', 'size', 'count'].indexOf(S.tsort) < 0) S.tsort = 'name';
 if (['all', 'photo', 'video'].indexOf(S.filter) < 0) S.filter = 'all';
 if (S.view !== 'list') S.view = 'tiles';
 S.tile = clamp(+S.tile || 220, 120, 480);

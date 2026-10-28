@@ -917,12 +917,12 @@ let treeSel = '', curRow = null;
 function tnode(rel, info) {
   let n = T.get(rel);
   if (!n) {
-    n = {rel: rel, name: '', np: null, nv: null, size: null, nd: null, kids: null, open: false, el: null, row: null, box: null, boxKey: null, loading: null};
+    n = {rel: rel, name: '', np: null, nv: null, size: null, mtime: null, nd: null, kids: null, open: false, el: null, row: null, box: null, boxKey: null, loading: null};
     T.set(rel, n);
   }
   if (info) {
     n.name = info.name;
-    n.np = info.n_photo; n.nv = info.n_video; n.size = info.size; n.nd = info.n_dirs;
+    n.np = info.n_photo; n.nv = info.n_video; n.size = info.size; n.mtime = info.mtime; n.nd = info.n_dirs;
   } else if (!n.name) {
     n.name = rel ? rel.slice(rel.lastIndexOf('/') + 1) : rootName;
   }
@@ -963,10 +963,34 @@ function fillBox(n) {
   n.box.replaceChildren(frag);
   n.boxKey = n.kids.join('\n');
 }
+// порядок веток дерева — своя сортировка (S.tsort/S.tdesc), не та, что у сетки
+function treeKey(n) {
+  switch (S.tsort) {
+    case 'date': return n.mtime || 0;
+    case 'size': return n.size || 0;
+    case 'count': return (n.np || 0) + (n.nv || 0);
+  }
+  return null;
+}
+function sortRels(rels) {
+  const k = S.tsort === 'name' ? null : treeKey, sg = S.tdesc ? -1 : 1;
+  return rels.sort((a, b) => {
+    const x = T.get(a), y = T.get(b);
+    const d = k ? k(x) - k(y) : 0;
+    return sg * (d || coll.compare(x.name, y.name));
+  });
+}
+function resortTree() {
+  for (const n of T.values()) {
+    if (!n.kids) continue;
+    sortRels(n.kids);
+    if (n.box && n.open && n.boxKey !== n.kids.join('\n')) fillBox(n);
+  }
+  if (curRow) curRow.scrollIntoView({block: 'nearest'});
+}
 function setKids(n, arr) {
-  const infos = arr.slice().sort((a, b) => coll.compare(a.name, b.name));
-  const rels = infos.map(d => d.rel);
-  for (const d of infos) tnode(d.rel, d);
+  for (const d of arr) tnode(d.rel, d);
+  const rels = sortRels(arr.map(d => d.rel));
   n.kids = rels;
   n.nd = rels.length;
   if (n.box && n.open) {

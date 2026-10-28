@@ -337,6 +337,8 @@ async function indexCmd(path, body, okMsg) {
 function syncControls() {
   $('#srt').value = S.sort;
   $('#sdir').textContent = S.desc ? '↓' : '↑';
+  $('#tsrt').value = S.tsort;
+  $('#tsdir').textContent = S.tdesc ? '↓' : '↑';
   $('#flt').value = S.filter;
   $('#sz').value = S.tile;
   document.querySelectorAll('#vw button').forEach(b => b.classList.toggle('on', b.dataset.v === S.view));
@@ -353,7 +355,9 @@ function wireControls() {
   $('#srt').addEventListener('change', e => { setS('sort', e.target.value); resort(); });
   $('#sdir').onclick = () => { setS('desc', !S.desc); syncControls(); resort(); };
   $('#flt').addEventListener('change', e => { setS('filter', e.target.value); resort(); });
-  blurAfter($('#srt')); blurAfter($('#flt')); blurAfter($('#sz'));
+  $('#tsrt').addEventListener('change', e => { setS('tsort', e.target.value); resortTree(); });
+  $('#tsdir').onclick = () => { setS('tdesc', !S.tdesc); syncControls(); resortTree(); };
+  blurAfter($('#srt')); blurAfter($('#tsrt')); blurAfter($('#flt')); blurAfter($('#sz'));
   let szRaf = 0;
   $('#sz').addEventListener('input', e => {
     setS('tile', +e.target.value);
