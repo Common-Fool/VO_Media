@@ -1,15 +1,18 @@
 """Разбор заголовков медиафайлов без внешних зависимостей.
 
 Поддерживаемые форматы:
-  Фото: JPEG, PNG, GIF, WebP
-  Видео: MP4, M4V
+  Фото: JPEG, PNG, WebP
+  Видео: MP4, M4V, MKV, WebM, GIF (GIF показывается как видео: у него есть длительность)
 """
 import os
 import struct
 from typing import Any, Dict, Optional, Tuple
 
-PHOTO_EXT = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
-VIDEO_EXT = frozenset({'.mp4', '.m4v'})
+PHOTO_EXT = frozenset({'.jpg', '.jpeg', '.png', '.webp'})
+VIDEO_EXT = frozenset({'.mp4', '.m4v', '.mkv', '.webm', '.gif'})
+
+MAX_GIF = 64 * 1024 * 1024      # GIF больше — без длительности (кадры пришлось бы читать целиком)
+MAX_EBML = 1024 * 1024          # из mkv/webm читаем не больше этого с начала файла
 
 
 def kind_of(name: str) -> Optional[str]:
@@ -437,17 +440,192 @@ def _read_mp4_meta(path: str) -> Dict[str, Any]:
         return empty
 
 
+def _gif_meta(f, size: int) -> Dict[str, Any]:
+    """GIF: размеры логического экрана и длительность — сумма задержек кадров из Graphic Control Extension.
+
+    Задержка в сотых долях секунды; 0 или 1 считается как 0,1 с (так показывают браузеры).
+    Блоки данных пропускаются по длинам; файл больше MAX_GIF — только размеры.
+    """
+    head = f.read(13)
+    if len(head) < 13 or head[:6] not in (b'GIF87a', b'GIF89a'):
+        return {'w': None, 'h': None, 'duration': None, 'rot': 1}
+    w, h = struct.unpack('<HH', head[6:10])
+    res = {'w': w or None, 'h': h or None, 'duration': None, 'rot': 1}
+    if size > MAX_GIF:
+        return res
+    data = head + f.read(max(0, size - 13))
+    n = len(data)
+    pos = 13
+    if data[10] & 0x80:                                 # глобальная палитра
+        pos += 3 << ((data[10] & 7) + 1)
+    total = 0                                           # сотые доли секунды
+    frames = 0
+    delay = None                                        # задержка из последнего GCE, ещё не отданная кадру
+
+    def skip_blocks(p):
+        """Пропустить цепочку подблоков (длина, данные), вернуть позицию после нулевого блока; -1 — обрыв."""
+        while p < n:
+            ln = data[p]
+            p += 1
+            if ln == 0:
+                return p
+            p += ln
+        return -1
+
+    while pos < n:
+        b = data[pos]
+        if b == 0x3b:                                   # конец файла
+            break
+        if b == 0x21:                                   # расширение
+            if pos + 2 > n:
+                break
+            if data[pos + 1] == 0xf9 and pos + 8 <= n and data[pos + 2] >= 4:
+                delay = data[pos + 4] | (data[pos + 5] << 8)
+            pos = skip_blocks(pos + 2)
+        elif b == 0x2c:                                 # кадр
+            if pos + 10 > n:
+                break
+            packed = data[pos + 9]
+            pos += 10
+            if packed & 0x80:                           # своя палитра кадра
+                pos += 3 << ((packed & 7) + 1)
+            pos = skip_blocks(pos + 1)                  # байт LZW min code size, затем данные
+            d = delay or 0
+            total += 10 if d <= 1 else d
+            frames += 1
+            delay = None
+        else:
+            break                                       # мусор вместо блока
+        if pos < 0:
+            break
+    if frames:
+        res['duration'] = round(total / 100.0, 3)
+    return res
+
+
+def _vint(buf: bytes, pos: int, keep_marker: bool) -> Tuple[Optional[int], int]:
+    """Число переменной длины EBML: (значение, длина). keep_marker — для ID элемента.
+
+    Значение None — «размер неизвестен» (все биты данных — единицы); длина 0 — неверная запись.
+    """
+    if pos >= len(buf):
+        return None, 0
+    first = buf[pos]
+    ln = 1
+    mask = 0x80
+    while ln <= 8 and not first & mask:
+        mask >>= 1
+        ln += 1
+    if ln > 8 or pos + ln > len(buf):
+        return None, 0
+    val = first if keep_marker else first & (mask - 1)
+    for i in range(1, ln):
+        val = (val << 8) | buf[pos + i]
+    if not keep_marker and val == (1 << (7 * ln)) - 1:
+        return None, ln
+    return val, ln
+
+
+def _ebml_children(buf: bytes, pos: int, end: int):
+    """Элементы EBML в [pos, end): (id, начало данных, конец данных или None при неизвестном размере)."""
+    while pos < end:
+        eid, n1 = _vint(buf, pos, True)
+        if not n1:
+            return
+        size, n2 = _vint(buf, pos + n1, False)
+        if not n2:
+            return
+        start = pos + n1 + n2
+        if size is None:
+            yield eid, start, None
+            return                                      # где кончается — неизвестно: дальше не идём
+        yield eid, start, start + size
+        pos = start + size
+
+
+def _ebml_uint(buf: bytes, a: int, b: int) -> Optional[int]:
+    if b - a < 1 or b - a > 8 or b > len(buf):
+        return None
+    return int.from_bytes(buf[a:b], 'big')
+
+
+def _parse_ebml(buf: bytes) -> Dict[str, Any]:
+    """Matroska/WebM: Segment → Info (TimecodeScale, Duration) и Tracks → видеодорожка (PixelWidth/PixelHeight)."""
+    res = {'w': None, 'h': None, 'duration': None, 'rot': 1}
+    n = len(buf)
+    seg = None
+    for eid, a, b in _ebml_children(buf, 0, n):
+        if eid == 0x18538067:                           # Segment
+            seg = (a, n if b is None else min(b, n))
+            break
+    if seg is None:
+        return res
+    scale = 1000000
+    raw_dur = None
+    for eid, a, b in _ebml_children(buf, seg[0], seg[1]):
+        if b is None or eid == 0x1F43B675:              # неизвестный размер или Cluster — заголовки кончились
+            break
+        b = min(b, n)
+        if eid == 0x1549A966:                           # Info
+            for cid, ca, cb in _ebml_children(buf, a, b):
+                if cb is None or cb > b:
+                    break
+                if cid == 0x2AD7B1:                     # TimecodeScale, нс
+                    v = _ebml_uint(buf, ca, cb)
+                    if v:
+                        scale = v
+                elif cid == 0x4489:                     # Duration, в единицах TimecodeScale
+                    if cb - ca == 4:
+                        raw_dur = struct.unpack('>f', buf[ca:cb])[0]
+                    elif cb - ca == 8:
+                        raw_dur = struct.unpack('>d', buf[ca:cb])[0]
+        elif eid == 0x1654AE6B and res['w'] is None:    # Tracks
+            for tid, ta, tb in _ebml_children(buf, a, b):
+                if tb is None or tb > b:
+                    break
+                if tid != 0xAE:                         # TrackEntry
+                    continue
+                ttype = None
+                vw = vh = None
+                for eid2, ea, eb in _ebml_children(buf, ta, tb):
+                    if eb is None or eb > tb:
+                        break
+                    if eid2 == 0x83:                    # TrackType: 1 — видео
+                        ttype = _ebml_uint(buf, ea, eb)
+                    elif eid2 == 0xE0:                  # Video
+                        for vid, va, vb in _ebml_children(buf, ea, eb):
+                            if vb is None or vb > eb:
+                                break
+                            if vid == 0xB0:
+                                vw = _ebml_uint(buf, va, vb)
+                            elif vid == 0xBA:
+                                vh = _ebml_uint(buf, va, vb)
+                if ttype == 1 and vw and vh:
+                    res['w'], res['h'] = vw, vh
+                    break
+    if raw_dur is not None and raw_dur == raw_dur and 0 < raw_dur < float('inf'):  # не NaN
+        res['duration'] = round(raw_dur * scale / 1e9, 3)
+    return res
+
+
 def read_meta(path: str, kind: str) -> Dict[str, Any]:
-    """Разбор метаданных файла.
+    """Разбор метаданных файла; формат выбирается по расширению (kind — запасной признак).
 
     Возвращает {'w': int|None, 'h': int|None, 'duration': float|None, 'rot': int}.
     При ошибке или неизвестном формате возвращает поля со значениями None и rot=1.
     """
     empty = {'w': None, 'h': None, 'duration': None, 'rot': 1}
     try:
-        if kind == 'video':
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.gif':
+            with open(path, 'rb', buffering=0) as f:
+                return _gif_meta(f, os.fstat(f.fileno()).st_size)
+        if ext in ('.mkv', '.webm'):
+            with open(path, 'rb', buffering=0) as f:
+                return _parse_ebml(f.read(MAX_EBML))
+        if ext in ('.mp4', '.m4v') or (kind == 'video' and ext not in PHOTO_EXT):
             return _read_mp4_meta(path)
-        if kind != 'photo':
+        if ext not in PHOTO_EXT and kind != 'photo':
             return empty
 
         with open(path, 'rb', buffering=0) as f:

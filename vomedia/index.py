@@ -32,6 +32,25 @@ JANITOR_EVERY = 600             # как часто (с) проверять ли
 MAX_ERRORS = 30                 # подряд ошибок папок — считаем, что NAS недоступна
 SKIP_NAMES = frozenset({'system volume information', '_to_delete', '_на_удаление'})
 KIND_PHOTO, KIND_VIDEO = 1, 2
+MAX_PROGRESS = 20000            # строк в progress (лишние — самые старые по ts)
+PROGRESS_MIN = 10               # позиция меньше — «не смотрели», строка удаляется
+PROGRESS_END = 5                # до конца меньше — «досмотрено», pos = dur
+
+
+def _exts_key(photo, video):
+    return 'photo:%s;video:%s' % (','.join(sorted(photo)), ','.join(sorted(video)))
+
+
+def _key_exts(key):
+    """Множество расширений из строки _exts_key."""
+    out = set()
+    for part in (key or '').split(';'):
+        out.update(x for x in part.partition(':')[2].split(',') if x)
+    return out
+
+
+EXTS = _exts_key(meta.PHOTO_EXT, meta.VIDEO_EXT)    # набор расширений; сменился — первый обход полный
+EXTS_V01 = _exts_key({'.jpg', '.jpeg', '.png', '.webp', '.gif'}, {'.mp4', '.m4v'})  # кеш без meta_kv.exts
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta_kv(k TEXT PRIMARY KEY, v TEXT);
@@ -54,7 +73,17 @@ CREATE TABLE IF NOT EXISTS files(
   UNIQUE(dir, name));
 CREATE INDEX IF NOT EXISTS files_meta ON files(meta) WHERE meta = 0;
 CREATE INDEX IF NOT EXISTS files_thumb ON files(dir) WHERE thumb = 1;
+CREATE TABLE IF NOT EXISTS progress(id INTEGER PRIMARY KEY, pos REAL, dur REAL, ts REAL);
+CREATE INDEX IF NOT EXISTS progress_ts ON progress(ts);
 """
+
+# колонки files, которые добавлены после v0.1 (ALTER TABLE), и индексы по ним
+FILES_V02 = """
+CREATE INDEX IF NOT EXISTS files_lname ON files(lname);
+CREATE INDEX IF NOT EXISTS files_first_seen ON files(first_seen) WHERE first_seen > 0;
+"""
+# столбцы файла для страницы (f — files, p — progress через LEFT JOIN), порядок — как в _file_obj
+FCOLS = 'f.id, f.name, f.kind, f.size, f.mtime, f.w, f.h, f.duration, f.thumb, p.pos'
 
 
 # ─── где лежит кеш ───
@@ -149,6 +178,22 @@ def _root_name(root):
     return os.path.basename(root.rstrip('/\\')) or root
 
 
+def _lower(s):
+    """lower() Python для SQL (кириллица; встроенный lower() SQLite знает только ASCII)."""
+    return s.lower() if isinstance(s, str) else s
+
+
+def _file_obj(r):
+    """Объект файла для страницы из строки, начинающейся со столбцов FCOLS."""
+    return {'id': r[0], 'name': r[1], 'kind': 'photo' if r[2] == KIND_PHOTO else 'video',
+            'size': r[3], 'mtime': r[4], 'w': r[5], 'h': r[6], 'duration': r[7], 'thumb': r[8], 'pos': r[9]}
+
+
+def _like_word(w):
+    """Слово запроса → шаблон LIKE '%слово%' с экранированием % _ и \\."""
+    return '%' + w.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+
+
 class Library(object):
     """Кеш одной открытой папки. Потокобезопасен: соединение на нить, запись под wlock."""
 
@@ -180,6 +225,9 @@ class Library(object):
         # метаданные
         self._meta_event = threading.Event()
         self._meta_thread = None
+        # first_seen = 0 для новых строк: 'all' — полного обхода ещё не было (иначе при первом запуске
+        # всё «новое»); иначе — расширения, добавленные после прошлого полного обхода (уже лежавшие mkv/webm)
+        self._fs_zero = frozenset()
         # место кеша: байты миниатюр и раскадровок (считает нить janitor, дальше — на ходу)
         self.cache_limit = 0                # байт; 0 — без лимита (задаёт app.py)
         self._bytes = {'thumbs': 0, 'story': 0, 'n_thumbs': 0, 'n_story': 0, 'ready': False}
@@ -197,6 +245,10 @@ class Library(object):
 
     def _connect(self):
         c = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False, isolation_level=None)
+        try:
+            c.create_function('pylower', 1, _lower, deterministic=True)
+        except (TypeError, sqlite3.NotSupportedError):     # старый SQLite без deterministic
+            c.create_function('pylower', 1, _lower)
         c.execute('PRAGMA synchronous=NORMAL')
         c.execute('PRAGMA cache_size=-20000')
         return c
@@ -245,12 +297,17 @@ class Library(object):
             r = c.execute("SELECT v FROM meta_kv WHERE k='schema'").fetchone()
             if r and r[0] != SCHEMA:
                 log.warning('Cache schema %s != %s, rebuilding', r[0], SCHEMA)
-                c.executescript('DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS dirs; DELETE FROM meta_kv;')
+                c.executescript('DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS dirs; DROP TABLE IF EXISTS progress; '
+                                'DELETE FROM meta_kv;')
                 shutil.rmtree(self.thumbs_dir, ignore_errors=True)
                 os.makedirs(self.thumbs_dir, exist_ok=True)
             c.executescript(DDL)
             if 'seen' not in [r[1] for r in c.execute('PRAGMA table_info(dirs)')]:
                 c.execute('ALTER TABLE dirs ADD COLUMN seen REAL')     # когда папку последний раз открывали
+            gif_fix = self._migrate_v02(c)
+            r = c.execute("SELECT v FROM meta_kv WHERE k='opened'").fetchone()
+            if r:                                                       # для /api/new?since=last
+                c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('prev_opened', ?)", (r[0],))
             c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('opened', ?)", (str(time.time()),))
             c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('schema', ?)", (SCHEMA,))
             c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('root', ?)", (self.root,))
@@ -263,6 +320,66 @@ class Library(object):
                 shutil.rmtree(self.story_dir, ignore_errors=True)
                 os.makedirs(self.thumbs_dir, exist_ok=True)
                 c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('thumb_px', ?)", (THUMB_PX,))
+            self._fs_zero = self._zero_exts(c)
+        if gif_fix:
+            self.recompute_totals()
+            with self._tx() as c:
+                c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('gif_video', '1')")
+
+    def _migrate_v02(self, c):
+        """Колонки v0.2 (lname, first_seen) и перевод GIF в видео. Вернуть True, если нужен пересчёт итогов."""
+        cols = [r[1] for r in c.execute('PRAGMA table_info(files)')]
+        if 'lname' not in cols or 'first_seen' not in cols:
+            t = time.monotonic()
+            n = c.execute('SELECT COUNT(*) FROM files').fetchone()[0]
+            c.execute('BEGIN IMMEDIATE')
+            try:
+                if 'lname' not in cols:
+                    c.execute('ALTER TABLE files ADD COLUMN lname TEXT')
+                    c.execute('UPDATE files SET lname=pylower(name)')
+                if 'first_seen' not in cols:            # прежние строки — не «новые»
+                    c.execute('ALTER TABLE files ADD COLUMN first_seen REAL DEFAULT 0')
+                c.execute('COMMIT')
+            except BaseException:
+                c.execute('ROLLBACK')
+                raise
+            if n:
+                log.info('Cache upgraded for v0.2 (%d files) in %.1f s', n, time.monotonic() - t)
+        c.executescript(FILES_V02)
+        if c.execute("SELECT v FROM meta_kv WHERE k='gif_video'").fetchone():
+            return False
+        # GIF стал видео: kind=2, метаданные перечитать (длительность); own_* всех папок — заново из files.
+        # Флаг gif_video ставится после recompute_totals() (в _init_db): прервались — повторится, это безопасно
+        c.execute('BEGIN IMMEDIATE')
+        try:
+            n = c.execute("UPDATE files SET kind=?, meta=0 WHERE lname LIKE '%.gif' AND kind<>?",
+                          (KIND_VIDEO, KIND_VIDEO)).rowcount
+            c.execute('UPDATE dirs SET '
+                      'own_photo=(SELECT COUNT(*) FROM files f WHERE f.dir=dirs.id AND f.kind=?), '
+                      'own_video=(SELECT COUNT(*) FROM files f WHERE f.dir=dirs.id AND f.kind=?), '
+                      'own_size=(SELECT IFNULL(SUM(f.size), 0) FROM files f WHERE f.dir=dirs.id)',
+                      (KIND_PHOTO, KIND_VIDEO))
+            c.execute('COMMIT')
+        except BaseException:
+            c.execute('ROLLBACK')
+            raise
+        if n:
+            log.info('%d GIF files are now videos', n)
+        return True
+
+    def _zero_exts(self, c):
+        """Значение для self._fs_zero по состоянию кеша (см. __init__)."""
+        if not c.execute("SELECT 1 FROM meta_kv WHERE k='full_done'").fetchone():
+            return 'all'
+        r = c.execute("SELECT v FROM meta_kv WHERE k='exts'").fetchone()
+        return frozenset(_key_exts(EXTS) - _key_exts(r[0] if r else EXTS_V01))
+
+    def _first_seen(self, name, now):
+        """first_seen для новой строки файла."""
+        z = self._fs_zero
+        if z == 'all' or (z and os.path.splitext(name)[1].lower() in z):
+            return 0
+        return now
 
     def _kv_get(self, k):
         r = self._db().execute('SELECT v FROM meta_kv WHERE k=?', (k,)).fetchone()
@@ -339,15 +456,18 @@ class Library(object):
                 ids.append([r[0], r[1]])
         return ids
 
+    DCOLS = 'id, rel, name, n_photo, n_video, size, n_dirs, mtime, listed'
+
+    def _dir_item(self, c, r):
+        """Объект папки для страницы из строки DCOLS."""
+        sid, rel, name, n_p, n_v, size, n_d, mt, li = r
+        return {'rel': rel, 'name': name, 'n_photo': n_p, 'n_video': n_v, 'size': size,
+                'n_dirs': n_d, 'mtime': mt, 'listed': li,
+                'thumbs': self._dir_thumbs(c, sid, rel, n_p + n_v)}
+
     def _dir_items(self, c, did):
-        out = []
-        rows = c.execute('SELECT id, rel, name, n_photo, n_video, size, n_dirs, mtime, listed '
-                         'FROM dirs WHERE parent=? ORDER BY name', (did,)).fetchall()
-        for sid, rel, name, n_p, n_v, size, n_d, mt, li in rows:
-            out.append({'rel': rel, 'name': name, 'n_photo': n_p, 'n_video': n_v, 'size': size,
-                        'n_dirs': n_d, 'mtime': mt, 'listed': li,
-                        'thumbs': self._dir_thumbs(c, sid, rel, n_p + n_v)})
-        return out
+        rows = c.execute('SELECT ' + self.DCOLS + ' FROM dirs WHERE parent=? ORDER BY name', (did,)).fetchall()
+        return [self._dir_item(c, r) for r in rows]
 
     def list_dir(self, rel):
         rel = self._norm(rel)
@@ -362,12 +482,9 @@ class Library(object):
             parents.append({'rel': '', 'name': self.root_name})
             for i in range(1, len(parts)):
                 parents.append({'rel': '/'.join(parts[:i]), 'name': parts[i - 1]})
-        files = []
-        for fid, fname, kind, size, mt, w, h, dur, th in c.execute(
-                'SELECT id, name, kind, size, mtime, w, h, duration, thumb FROM files WHERE dir=? ORDER BY name',
-                (did,)):
-            files.append({'id': fid, 'name': fname, 'kind': 'photo' if kind == KIND_PHOTO else 'video',
-                          'size': size, 'mtime': mt, 'w': w, 'h': h, 'duration': dur, 'thumb': th})
+        files = [_file_obj(r) for r in c.execute(
+            'SELECT ' + FCOLS + ' FROM files f LEFT JOIN progress p ON p.id=f.id WHERE f.dir=? ORDER BY f.name',
+            (did,))]
         return {'rel': rel, 'name': name, 'listed': listed, 'mtime': mtime, 'parents': parents,
                 'dirs': self._dir_items(c, did), 'files': files}
 
@@ -394,6 +511,183 @@ class Library(object):
         return {'id': fid, 'name': r[1], 'kind': 'photo' if r[2] == KIND_PHOTO else 'video',
                 'size': r[3], 'mtime': r[4], 'path': self._abs(r[0], r[1])}
 
+    # ─── поиск, плоский вид, новое (только кеш) ───
+
+    def search(self, q, limit=500):
+        """Файлы и папки, в имени которых есть все слова q (без учёта регистра, кириллица тоже).
+
+        Файлы — по индексу lname в порядке имени, пока не наберётся limit; папки — перебором имён (их на порядки меньше).
+        """
+        words = [w for w in _lower(q or '').split() if w]
+        if not words:
+            return {'q': q, 'files': [], 'dirs': [], 'truncated': False}
+        c = self._db()
+        where = ' AND '.join(["f.lname LIKE ? ESCAPE '\\'"] * len(words))
+        rows = c.execute('SELECT ' + FCOLS + ', d.rel FROM files f CROSS JOIN dirs d ON d.id=f.dir '
+                         'LEFT JOIN progress p ON p.id=f.id WHERE ' + where + ' ORDER BY f.lname, f.id LIMIT ?',
+                         [_like_word(w) for w in words] + [limit + 1]).fetchall()
+        files = []
+        for r in rows[:limit]:
+            o = _file_obj(r)
+            o['rel'] = r[10]
+            files.append(o)
+        drows = []
+        for r in c.execute('SELECT ' + self.DCOLS + ' FROM dirs WHERE id<>1'):
+            ln = r[2].lower()
+            if all(w in ln for w in words):
+                drows.append(r)
+        drows.sort(key=lambda r: (r[2].lower(), r[1]))
+        dirs = [self._dir_item(c, r) for r in drows[:limit]]
+        return {'q': q, 'files': files, 'dirs': dirs, 'truncated': len(rows) > limit or len(drows) > limit}
+
+    FLAT_SORT = {'name': 'f.lname', 'date': 'f.mtime', 'size': 'f.size',
+                 'duration': 'CASE WHEN f.kind=%d THEN 0 ELSE f.duration END' % KIND_PHOTO}
+
+    def flat(self, rel, sort='name', desc=False, filt='all', offset=0, limit=5000):
+        """Все файлы папки и её подпапок (из кеша) одной страницей offset/limit с сортировкой на сервере.
+        None — папки нет в кеше."""
+        rel = self._norm(rel)
+        c = self._db()
+        if c.execute('SELECT 1 FROM dirs WHERE rel=?', (rel,)).fetchone() is None:
+            return None
+        cond, args = [], []
+        if rel:                                         # поддерево — диапазон по rel, как в _drop_subtree
+            cond.append('(d.rel=? OR (d.rel>=? AND d.rel<?))')
+            args += [rel, rel + '/', rel + '0']
+        if filt in ('photo', 'video'):
+            cond.append('f.kind=?')
+            args.append(KIND_PHOTO if filt == 'photo' else KIND_VIDEO)
+        where = (' WHERE ' + ' AND '.join(cond)) if cond else ''
+        # в корне — только files (порядок по имени берётся из индекса lname), в поддереве — от dirs по диапазону rel
+        src = 'files f' if not rel else 'dirs d CROSS JOIN files f ON f.dir=d.id'
+        total = c.execute('SELECT COUNT(*) FROM ' + src + where, args).fetchone()[0]
+        key = self.FLAT_SORT.get(sort, 'f.lname')
+        order = ' ORDER BY %s%s, f.lname, f.id' % (key, ' DESC' if desc else '')
+        if sort == 'duration':                          # неизвестная длительность — в конце при любом направлении
+            order = ' ORDER BY %s IS NULL,%s' % (key, order[9:])
+        # страница id — без соединения с progress (OFFSET пропускает строки дёшево), потом сами строки
+        ids = [r[0] for r in c.execute('SELECT f.id FROM ' + src + where + order + ' LIMIT ? OFFSET ?',
+                                       args + [limit, offset])]
+        rows = {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            for r in c.execute('SELECT ' + FCOLS + ', d.rel FROM files f CROSS JOIN dirs d ON d.id=f.dir '
+                               'LEFT JOIN progress p ON p.id=f.id WHERE f.id IN (%s)' % ','.join('?' * len(part)),
+                               part):
+                rows[r[0]] = r
+        files = []
+        for fid in ids:
+            r = rows.get(fid)
+            if r is not None:
+                o = _file_obj(r)
+                o['rel'] = r[10]
+                files.append(o)
+        return {'rel': rel, 'total': total, 'offset': offset, 'files': files}
+
+    def new_files(self, since, limit=5000):
+        """Файлы, впервые увиденные после since ('last' — прошлое открытие библиотеки, или число дней)."""
+        now = time.time()
+        if since == 'last':
+            try:
+                ts = float(self._kv_get('prev_opened') or 0)
+            except ValueError:
+                ts = 0
+            if ts <= 0:
+                ts = now - 7 * 86400
+        else:
+            ts = now - float(since) * 86400
+        c = self._db()
+        # first_seen > 0 в условии — чтобы SQLite взял частичный индекс files_first_seen
+        where = ' WHERE f.first_seen > 0 AND f.first_seen > ?'
+        total = c.execute('SELECT COUNT(*) FROM files f' + where, (ts,)).fetchone()[0]
+        rows = c.execute('SELECT ' + FCOLS + ', d.rel FROM files f CROSS JOIN dirs d ON d.id=f.dir '
+                         'LEFT JOIN progress p ON p.id=f.id' + where + ' ORDER BY f.first_seen DESC, f.id DESC LIMIT ?',
+                         (ts, limit)).fetchall()
+        files = []
+        for r in rows:
+            o = _file_obj(r)
+            o['rel'] = r[10]
+            files.append(o)
+        return {'since': ts, 'total': total, 'files': files}
+
+    # ─── позиция просмотра видео ───
+
+    def save_progress(self, fid, pos, dur):
+        """Запомнить позицию: pos < 10 — удалить (не смотрели), почти до конца — pos = dur. False — файла нет."""
+        with self._tx() as c:
+            r = c.execute('SELECT duration FROM files WHERE id=?', (fid,)).fetchone()
+            if r is None:
+                return False
+            if not dur or dur <= 0:
+                dur = r[0]
+            if pos < PROGRESS_MIN:
+                c.execute('DELETE FROM progress WHERE id=?', (fid,))
+                return True
+            if dur and pos >= dur - PROGRESS_END:
+                pos = dur
+            c.execute('INSERT OR REPLACE INTO progress(id, pos, dur, ts) VALUES(?, ?, ?, ?)',
+                      (fid, pos, dur, time.time()))
+            extra = c.execute('SELECT COUNT(*) FROM progress').fetchone()[0] - MAX_PROGRESS
+            if extra > 0:
+                c.execute('DELETE FROM progress WHERE id IN (SELECT id FROM progress ORDER BY ts LIMIT ?)', (extra,))
+        return True
+
+    # ─── переименование (файл уже переименован files.py) ───
+
+    def file_renamed(self, fid, new_name):
+        """Поправить кеш после os.rename файла в той же папке: id, миниатюра и позиция сохраняются.
+
+        Новое имя не медиа (или его пропустил бы обход) — строка удаляется, итоги папки поправляются, вернуть None.
+        Иначе — объект файла, как в list_dir. None и если id нет в кеше.
+        """
+        k = meta.kind_of(new_name)
+        keep = k is not None and new_name[:1] != '.' and _encodable(new_name) and '/' not in new_name \
+            and '\\' not in new_name
+        kind = KIND_PHOTO if k == 'photo' else KIND_VIDEO
+        unlink = []
+        with self._tx() as c:
+            r = c.execute('SELECT dir, name, kind, size FROM files WHERE id=?', (fid,)).fetchone()
+            if r is None:
+                return None
+            did, old_name, o_kind, size = r
+            size = size or 0
+            # строка с таким именем уже есть (файл заменён переименованием) — её больше нет на диске
+            gone = [(x[0], x[1], x[2] or 0) for x in c.execute(
+                'SELECT id, kind, size FROM files WHERE dir=? AND name=? AND id<>?', (did, new_name, fid))]
+            if not keep:
+                gone.append((fid, o_kind, size))
+            d_p = d_v = d_s = 0
+            for gid, gk, gs in gone:
+                c.execute('DELETE FROM files WHERE id=?', (gid,))
+                c.execute('DELETE FROM progress WHERE id=?', (gid,))
+                unlink.append(gid)
+                if gk == KIND_PHOTO:
+                    d_p -= 1
+                else:
+                    d_v -= 1
+                d_s -= gs
+            if keep:
+                ext_changed = os.path.splitext(old_name)[1].lower() != os.path.splitext(new_name)[1].lower()
+                # другое расширение — другой разборщик заголовка: метаданные перечитать (миниатюра та же)
+                c.execute('UPDATE files SET name=?, lname=?, kind=?, meta=CASE WHEN ? THEN 0 ELSE meta END '
+                          'WHERE id=?', (new_name, new_name.lower(), kind, ext_changed, fid))
+                if kind != o_kind:
+                    d_p += 1 if kind == KIND_PHOTO else -1
+                    d_v += 1 if kind == KIND_VIDEO else -1
+            if d_p or d_v or d_s:
+                c.execute('UPDATE dirs SET own_photo=own_photo+?, own_video=own_video+?, own_size=own_size+? '
+                          'WHERE id=?', (d_p, d_v, d_s, did))
+                self._bump(c, did, d_p, d_v, d_s)
+            row = None
+            if keep:
+                row = c.execute('SELECT ' + FCOLS + ' FROM files f LEFT JOIN progress p ON p.id=f.id WHERE f.id=?',
+                                (fid,)).fetchone()
+        self._unlink_thumbs(unlink)
+        if keep:
+            self._meta_event.set()
+            return _file_obj(row)
+        return None
+
     # ─── слияние списка папки с кешем ───
 
     def _bump(self, c, did, d_p, d_v, d_s):
@@ -413,6 +707,8 @@ class Library(object):
         tids = [r[0] for r in c.execute(
             'SELECT f.id FROM dirs d CROSS JOIN files f ON f.dir=d.id '
             'WHERE f.thumb=1 AND (d.rel=? OR (d.rel>=? AND d.rel<?))', args)]
+        c.execute('DELETE FROM progress WHERE id IN (SELECT f.id FROM dirs d CROSS JOIN files f ON f.dir=d.id '
+                  'WHERE d.rel=? OR (d.rel>=? AND d.rel<?))', args)
         c.execute('DELETE FROM files WHERE dir IN (SELECT id FROM dirs WHERE rel=? OR (rel>=? AND rel<?))', args)
         c.execute('DELETE FROM dirs WHERE rel=? OR (rel>=? AND rel<?)', args)
         return tids
@@ -457,6 +753,7 @@ class Library(object):
             old[name] = (fid, kind, size, mt, th)
         ins, upd = [], []
         n_p = n_v = total = 0
+        now = time.time()
         for name, (kind, size, mt) in files.items():
             if kind == KIND_PHOTO:
                 n_p += 1
@@ -465,7 +762,7 @@ class Library(object):
             total += size
             o = old.pop(name, None)
             if o is None:
-                ins.append((did, name, kind, size, mt))
+                ins.append((did, name, kind, size, mt, name.lower(), self._first_seen(name, now)))
             elif o[1] != kind or o[2] != size or o[3] is None or abs(o[3] - mt) > 0.001:
                 upd.append((kind, size, mt, o[0]))
                 unlink.append(o[0])
@@ -474,12 +771,15 @@ class Library(object):
             gone.append((o[0],))
             unlink.append(o[0])
         if ins:
-            c.executemany('INSERT INTO files(dir, name, kind, size, mtime) VALUES(?, ?, ?, ?, ?)', ins)
+            c.executemany('INSERT INTO files(dir, name, kind, size, mtime, lname, first_seen) '
+                          'VALUES(?, ?, ?, ?, ?, ?, ?)', ins)
         if upd:
             c.executemany('UPDATE files SET kind=?, size=?, mtime=?, w=NULL, h=NULL, duration=NULL, rot=NULL, '
                           'meta=0, thumb=0 WHERE id=?', upd)
+            c.executemany('DELETE FROM progress WHERE id=?', [(u[3],) for u in upd])
         if gone:
             c.executemany('DELETE FROM files WHERE id=?', gone)
+            c.executemany('DELETE FROM progress WHERE id=?', gone)
         if ins or upd or gone:
             changed = True
 
@@ -625,8 +925,8 @@ class Library(object):
         with self._ixlock:
             if self._closed or self._ix_running:
                 return
-            if not self._kv_get('full_done'):
-                full = True                     # первый обход пустой БД — полный
+            if not self._kv_get('full_done') or self._kv_get('exts') != EXTS:
+                full = True                     # первый обход пустой БД или новый набор расширений — полный
             self._stop_ix.clear()
             self._st.update(full=bool(full), dirs=0, listed=0, current='', started=time.time(),
                             finished=None, error='')
@@ -662,6 +962,8 @@ class Library(object):
                 self.recompute_totals()
                 with self._tx() as c:
                     c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('full_done', ?)", (str(time.time()),))
+                    c.execute("INSERT OR REPLACE INTO meta_kv(k, v) VALUES('exts', ?)", (EXTS,))
+                self._fs_zero = frozenset()
         except Exception as e:
             if not self._closed:
                 log.exception('Index walk failed')
