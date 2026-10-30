@@ -306,6 +306,7 @@ function openViewer(f) {
 }
 
 function closeViewer() {
+  if (V.tov) V.tov.hidden = true;
   if (!V.open) return;
   const f = V.list[V.i];
   clearTimeout(V.clickT);
@@ -458,7 +459,7 @@ function vPreload(i) {
   const alive = () => V.open && V.sess === sess && curRel === rel && vMode() === 'dir';
   (async () => {
     try {
-      const nb = await getJson(q('/api/neighbor?rel=' + encodeURIComponent(rel) + '&step=1'), signal);
+      const nb = await getJson(nbUrl(rel, 1), signal);
       if (!alive() || nb.rel == null) return;
       const d = await getJson(dirUrl(normRel(nb.rel), false), signal);
       if (!alive() || d.missing || typeof thumbPrefetch !== 'function') return;
@@ -506,7 +507,7 @@ async function vCross(step, slide) {
   try {
     let rel = curRel;
     for (let n = 0; n < 50; n++) {
-      const nb = await getJson(q('/api/neighbor?rel=' + encodeURIComponent(rel) + '&step=' + step));
+      const nb = await getJson(nbUrl(rel, step));
       if (!alive()) return;
       if (nb.rel == null) { if (slide || S.slide) vSetSlide(0); hud(step > 0 ? 'Last folder' : 'First folder'); return; }
       rel = normRel(nb.rel);
@@ -545,6 +546,19 @@ function vUi() {
   $vknob.style.left = p + '%';
   if (!$vtl.hidden) $vtlm.style.left = p + '%';
   $vtime.textContent = fmtDur(t) + ' / ' + fmtDur(d);
+  if (V.tov && !V.tov.hidden) V.tov.textContent = $vtime.textContent;
+}
+// перемотка клавишами при скрытой панели: время «позиция / длина» там же, где оно стоит в панели, на 1,2 с
+function vTimeFlash() {
+  if (!$v.classList.contains('idle') && !$v.classList.contains('nobar')) return;
+  if (!V.tov) { V.tov = document.createElement('div'); V.tov.id = 'vtov'; V.tov.hidden = true; $v.append(V.tov); }
+  const r = $vtime.getBoundingClientRect(), ok = r.width && r.top >= 0 && r.bottom <= innerHeight;
+  V.tov.style.left = (ok ? r.left + r.width / 2 : innerWidth / 2) + 'px';   // панель ещё не разложена — низ по центру
+  V.tov.style.top = (ok ? r.top + r.height / 2 : innerHeight - 36) + 'px';
+  V.tov.hidden = false;
+  V.tov.textContent = $vtime.textContent;
+  clearTimeout(V.tovT);
+  V.tovT = setTimeout(() => { V.tov.hidden = true; }, 1200);
 }
 function vTick() {
   if (!V.open || !V.vsrc || V.bad) return;
@@ -581,7 +595,7 @@ function vSeekTo(t) {
   }
   vUi();
 }
-const vSeekBy = dt => vSeekTo((V.seekT != null ? V.seekT : $vv.currentTime || 0) + dt);
+const vSeekBy = dt => { vSeekTo((V.seekT != null ? V.seekT : $vv.currentTime || 0) + dt); if (V.open && vVideo(V.list[V.i]) && !V.bad) vTimeFlash(); };
 
 function applyVol() {
   $vv.volume = S.volume;
@@ -868,7 +882,7 @@ function viewerKey(e) {
   }
   const f = V.list[V.i];
   const vid = vVideo(f) && !V.bad;
-  if (k === 'Backspace' && !e.ctrlKey) { if (vid) vSeekTo(0); return true; }
+  if (k === 'Backspace' && !e.ctrlKey) { if (vid) { vSeekTo(0); vTimeFlash(); } return true; }
   if (!e.ctrlKey && (e.code === 'Comma' || e.code === 'Period' || [',', '.', '<', '>'].includes(k))) {
     const dir = e.code === 'Comma' || k === ',' || k === '<' ? -1 : 1;
     if (e.shiftKey) vRate(dir, false);

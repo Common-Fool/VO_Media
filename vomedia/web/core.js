@@ -12,6 +12,8 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;',
 const fUrl = id => q('/f/' + id);
 const tUrl = f => q('/t/' + f.id + '?v=' + Math.round(f.mtime || 0));
 const tUrlId = id => q('/t/' + id);
+// соседняя папка со своими файлами — в порядке дерева (его сортировка S.tsort/S.tdesc)
+const nbUrl = (rel, step) => q('/api/neighbor?rel=' + encodeURIComponent(rel) + '&step=' + step + '&sort=' + S.tsort + '&desc=' + (S.tdesc ? 1 : 0));
 const dirUrl = (rel, fresh) => q('/api/dir?rel=' + encodeURIComponent(rel) + (fresh ? '&fresh=1' : ''));
 const coll = new Intl.Collator(undefined, {numeric: true, sensitivity: 'base'});
 const rootName = BOOT.rootName || BOOT.root || 'Library';

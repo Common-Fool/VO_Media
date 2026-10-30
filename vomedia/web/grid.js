@@ -288,7 +288,7 @@ async function gridCross(step) {
   if (crossBusy || MODE === 'search' || MODE === 'new') return;
   crossBusy = true;
   try {
-    const nb = await getJson(q('/api/neighbor?rel=' + encodeURIComponent(curRel) + '&step=' + step));
+    const nb = await getJson(nbUrl(curRel, step));
     if (nb.rel == null) toast(step > 0 ? 'Last folder' : 'First folder');
     else await openDir(nb.rel);
   } catch (e) { toast('Cannot open the folder: ' + e.message, true); }

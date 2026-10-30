@@ -1269,51 +1269,59 @@ class Library(object):
 
     # ─── соседняя папка (переход в просмотрщике) ───
 
-    @staticmethod
-    def _node(c, did):
-        return c.execute('SELECT id, parent, rel, name, own_photo + own_video FROM dirs WHERE id=?', (did,)).fetchone()
+    NCOLS = 'id, parent, rel, name, own_photo + own_video, mtime, size, n_photo + n_video'
+    # порядок веток как в дереве страницы (sortRels в grid.js): ключ, при равенстве — имя; desc переворачивает оба
+    NSORT = {'date': 5, 'size': 6, 'count': 7}
 
-    @staticmethod
-    def _kids(c, did):
-        rows = c.execute('SELECT id, parent, rel, name, own_photo + own_video FROM dirs WHERE parent=?', (did,)).fetchall()
-        rows.sort(key=lambda r: _nat(r[3]))
+    @classmethod
+    def _node(cls, c, did):
+        return c.execute('SELECT ' + cls.NCOLS + ' FROM dirs WHERE id=?', (did,)).fetchone()
+
+    @classmethod
+    def _kids(cls, c, did, sort='name', desc=False):
+        rows = c.execute('SELECT ' + cls.NCOLS + ' FROM dirs WHERE parent=?', (did,)).fetchall()
+        i = cls.NSORT.get(sort)
+        if i is None:
+            rows.sort(key=lambda r: _nat(r[3]), reverse=desc)
+        else:
+            rows.sort(key=lambda r: (r[i] or 0, _nat(r[3])), reverse=desc)
         return rows
 
-    def _pre_next(self, c, n):
+    def _pre_next(self, c, n, sort, desc):
         """Следующая папка в порядке дерева (обход в глубину)."""
-        k = self._kids(c, n[0])
+        k = self._kids(c, n[0], sort, desc)
         if k:
             return k[0]
         while n is not None and n[1] is not None:
-            sib = self._kids(c, n[1])
+            sib = self._kids(c, n[1], sort, desc)
             i = [x[0] for x in sib].index(n[0])
             if i + 1 < len(sib):
                 return sib[i + 1]
             n = self._node(c, n[1])
         return None
 
-    def _pre_prev(self, c, n):
+    def _pre_prev(self, c, n, sort, desc):
         """Предыдущая папка в порядке дерева."""
         if n[1] is None:
             return None
-        sib = self._kids(c, n[1])
+        sib = self._kids(c, n[1], sort, desc)
         i = [x[0] for x in sib].index(n[0])
         if i == 0:
             return self._node(c, n[1])
         n = sib[i - 1]
         while True:                             # самая последняя папка поддерева предыдущего соседа
-            k = self._kids(c, n[0])
+            k = self._kids(c, n[0], sort, desc)
             if not k:
                 return n
             n = k[-1]
 
-    def neighbor_dir(self, rel, step):
-        """rel ближайшей папки со своими файлами после (step > 0) или до (step < 0) данной; None — нет."""
+    def neighbor_dir(self, rel, step, sort='name', desc=False):
+        """rel ближайшей папки со своими файлами после (step > 0) или до (step < 0) данной; None — нет.
+        sort/desc — сортировка веток дерева ('name' | 'date' | 'size' | 'count')."""
         c = self._db()
-        n = c.execute('SELECT id, parent, rel, name, own_photo + own_video FROM dirs WHERE rel=?',
-                      (self._norm(rel),)).fetchone()
+        n = c.execute('SELECT ' + self.NCOLS + ' FROM dirs WHERE rel=?', (self._norm(rel),)).fetchone()
         while n is not None:
-            n = self._pre_next(c, n) if step > 0 else self._pre_prev(c, n)
+            n = self._pre_next(c, n, sort, desc) if step > 0 else self._pre_prev(c, n, sort, desc)
             if n is not None and n[4] > 0:
                 return n[2]
         return None

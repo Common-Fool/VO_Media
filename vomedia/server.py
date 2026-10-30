@@ -387,7 +387,7 @@ class Handler(BaseHTTPRequestHandler):
             step = -1 if qv('step') == '-1' else 1
             with ctx.use() as lib:
                 lib.touch()
-                return self.reply(200, {'rel': lib.neighbor_dir(rel, step)})
+                return self.reply(200, {'rel': lib.neighbor_dir(rel, step, qv('sort') or 'name', qv('desc') == '1')})
         if len(p) == 2 and p[0] == 's':
             fid = file_id(p[1])
             with ctx.use() as lib:
