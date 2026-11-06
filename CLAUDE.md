@@ -13,7 +13,7 @@ Python 3.8+, только стандартная библиотека; `pywebvie
 
 - Общаться по-русски, коротко, технически плотно. Интерфейс, сообщения, журнал, `--help` — на английском; комментарии в коде — по-русски.
 - Можно: `py_compile`, проверка JS, тестовый сервер на временных папках (`VOMEDIA_HOME`) и проверка во встроенном браузере.
-  **Без команды владельца не собирать exe.**
+  **Без команды владельца не собирать exe локально. Сборку делает GitHub Actions при push, релиз — по тегу `v` + `VERSION` (или вручную с тегом).**
 - Исполнители: Sonnet, Codex (Sol), Gemini Flash (agy). **Haiku не использовать.** Ревьюит не автор кода.
 - Не пытаться воспроизводить Windows, SMB, WebView2 в песочнице: это проверяет владелец.
 - Среда владельца: Windows 10/11, RTX 5080, библиотека на Synology по SMB (больше 1 млн файлов; мелкие запросы по сети дорогие).
@@ -33,7 +33,6 @@ Python 3.8+, только стандартная библиотека; `pywebvie
 
 - Листы-превью как в VSPO «с условиями» (сетка кадров с таймкодами через ffmpeg, не для всех видео) — обсудить.
 - Перепаковка ffmpeg на лету (mkv со звуком AC3/DTS, HEVC без расширения, `.ts`) — если окажется, что многие файлы не играют напрямую.
-- GitHub Actions, релизы, самообновление (как в VSPO).
 - macOS: диалог tkinter из нити HTTP; Linux: временный сбой stat по SMB убирает файл из кеша.
 - Вытеснение кеша по одной папке за раз — грубое при папках на тысячи миниатюр.
 
@@ -50,15 +49,47 @@ Python 3.8+, только стандартная библиотека; `pywebvie
 8. `currentTime =` на каждый повтор зажатой клавиши → каждая перемотка обрывает прошлую до показа кадра, видео стоит (по SMB особенно).
    Пока `$vv.seeking`, цель копится в `V.seekT`, последнюю отправляет `seeked` (`vSeekTo()` в `viewer.js`).
 
-## Сборка exe (только с разрешения владельца)
+## Обновление с GitHub и донаты
+
+- `VERSION` в `vomedia/__init__.py` — формат X.Y; тег релиза — `v` + `VERSION` (задача release проверяет совпадение).
+  `REPO`, `LINKS`, `ASSETS` там же: `Common-Fool/VO_Media`, файлы `VO_Media.exe`, `VO_Media-mac.zip`, `VO_Media-x86_64.AppImage`.
+- `vomedia/update.py` — перенос решений VO SP; зависит только от stdlib и `__init__.py`. `configure(read_all, write_all, SLOCK,
+  app.prepare_restart)` передаёт настройки и остановку библиотеки из `app.py`, обратных импортов нет.
+- `check_update()` читает `api.github.com/repos/<REPO>/releases/latest` через urllib без ключа: один раз за запуск в фоне
+  по первому `GET /api/app`, далее по кнопке меню. Флаг `checking` ставится до запуска нити, чтобы страница начала опрос.
+  Новая версия — зелёная точка на ☰, пункт «Update to vX.Y» с бейджем new, заметки релиза в окне Updates.
+- `install_kind()`: `exe` (Windows), `app` (macOS), `appimage` (Linux с `APPIMAGE`), `source` (пакет исходников), `''` (неизвестная сборка).
+  Исходники и неизвестная сборка не обновляются сами: только скачивание вручную со страницы релизов.
+- `update_worker()` проверяет размер, MZ/PK/ELF и sha256 из GitHub `digest`, если он есть. exe переименовывается в `.old`, новый на место
+  (при ошибке переименования — откат). macOS: `ditto -x -k` сохраняет права и ссылки, `VO_Media.app` → `VO_Media.app.old`, новый на место.
+  AppImage — `os.replace`. `cleanup_old()` удаляет `VO_Media.exe.old` / `VO_Media.app.old` в фоне при следующем запуске.
+- Перед `restart()` страница дожидается `flushS()`, `App.prepare_restart()` сохраняет текущую папку и закрывает `Library`, останавливая индексацию.
+  Перезапуск получает текущую папку и прежние параметры запуска; окружение очищается от `_MEI*`/`_PYI*`/`APPIMAGE*`,
+  ставится `PYINSTALLER_RESET_ENVIRONMENT=1`, затем старый процесс выходит через `os._exit(0)`.
+- `fix_env()` при старте: Homebrew в PATH на macOS, исходный LD_LIBRARY_PATH для дочерних процессов в Linux. `die()` для .app — osascript.
+- Внешние ссылки открываются браузером по умолчанию только по имени из `LINKS` (`POST /api/link {name}`): github, releases, monobank, kofi, crypto.
+- Поддержка: кнопка Support в шапке и пункт меню → Monobank, Ko-fi, Crypto и исходный SVG QR банки Monobank из VO SP.
+  Напоминания раз в 7 дней, после «Remind me less often» — 30 (`DONATE_DAYS`); частоту в интерфейсе не писать.
+  Первый запуск только назначает срок. Общее состояние `donate: {next, rare}` в settings.json, вне настроек папок. GitHub — `.github/FUNDING.yml`.
+- Стили дополнений — `update.css`; `app.css` не меняется. Новый файл страницы добавлять в `STATIC` и загрузчик `index.html`.
+
+## Сборка (PyInstaller, GitHub Actions)
+
+`.github/workflows/build.yml` (workflow Build) при каждом push и вручную собирает на Python 3.12:
+Windows onefile `VO_Media.exe` с pywebview; macOS arm64 `VO_Media.app` → `VO_Media-mac.zip` через ditto;
+Linux ubuntu-22.04 onedir без pywebview → `VO_Media-x86_64.AppImage` через appimagetool (открывает браузер).
+Артефакты: VO_Media-windows, VO_Media-macos, VO_Media-linux. Тег `v*` или ручное поле release запускает задачу release:
+проверка тега по `vomedia/__init__.py`, заметки из коммитов, публикация трёх файлов.
+Точка входа — `vomedia.py`, страница включается через `--add-data`, иконки — `assets/vomedia.ico` / `assets/vomedia.png`.
+`VO Media.spec` для workflow не нужен, не удалять его. macOS-сборка не подписана Apple: первый запуск правым кликом → Open или `xattr -cr`.
+Локальная сборка Windows (только по команде владельца):
 
 ```
-python -m PyInstaller --noconfirm --onefile --noconsole --name "VO Media" --add-data "vomedia/web;vomedia/web" --collect-all webview --collect-all pythonnet --collect-all clr_loader --icon assets/vomedia.ico vomedia.py
+python -m PyInstaller --noconfirm --onefile --noconsole --name VO_Media --add-data "vomedia/web;vomedia/web" --collect-all webview --collect-all pythonnet --collect-all clr_loader --icon assets/vomedia.ico vomedia.py
 ```
 
-Результат — `dist\VO Media.exe` (~23 МБ). Страница берётся из `sys._MEIPASS/vomedia/web` (`server.web_dir()`).
+Результат — `dist\VO_Media.exe`. Страница берётся из `sys._MEIPASS/vomedia/web` (`server.web_dir()`).
 Иконка — `assets/vomedia.ico` (рисует `assets/make_icon.py`, нужен Pillow; во вкладке страницы — такой же SVG в `<link rel="icon">`).
-Workflow GitHub Actions пока нет — сборка вручную.
 
 ## Как проверять
 

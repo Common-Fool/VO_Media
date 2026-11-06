@@ -14,13 +14,14 @@
 - Основная система — Windows 10/11, работать должно и на macOS/Linux.
 - Фото: `.jpg .jpeg .png .webp .gif`. Видео: `.mp4 .m4v` (H.264, играются тегом `<video>` напрямую). Остальное не показывается.
 - Интерфейс, сообщения, журнал, `--help` — на английском. Комментарии и докстринги — по-русски, коротко.
-- Образец стиля и готовых решений — `..\Steam_View\pairview.py` (VSPO) и его `CLAUDE.md`.
+- Образец стиля и готовых решений — `..\Steam_View\pairview.py` (VO SP) и его `CLAUDE.md`.
 
 ## Файлы
 
 ```
 vomedia.py                 точка входа: from vomedia.app import main; main()
-vomedia/__init__.py        APP = 'VO Media', VERSION = '0.1.0'
+vomedia/__init__.py        APP = 'VO Media', VERSION = '0.3', REPO, LINKS, ASSETS
+vomedia/update.py          обновления GitHub, донаты, окружение сборок (stdlib + __init__; настройки и остановка через configure)
 vomedia/meta.py            разбор заголовков файлов (без зависимостей от других модулей)
 vomedia/index.py           кеш SQLite, обход, фоновые нити, миниатюры (зависит только от meta)
 vomedia/server.py          HTTP (зависит от index)
@@ -202,7 +203,13 @@ def make_server(port: int, ctx) -> Server       # ctx — объект App из 
 | Метод | Путь | Ответ |
 |---|---|---|
 | GET | `/` | `web/index.html`, в нём заменить `/*BOOT*/{}` на JSON `{"token","app","version","root","rootName","settings","recent"}` |
-| GET | `/web/app.js`, `/web/app.css` | статика из папки `web` (рядом с модулем; в PyInstaller — `sys._MEIPASS/vomedia/web`) |
+| GET | `/web/<name>` | только файлы из `STATIC`: core/grid/viewer/ui.js, app/grid/viewer/update.css (в PyInstaller — `sys._MEIPASS/vomedia/web`) |
+| GET | `/api/app` | `{update: <статус>, donate: bool}`; версия в `update.version`; первая проверка GitHub в фоне, первый запуск только назначает срок доната |
+| GET | `/api/update` | `{version, kind, checked, checking, error, latest, newer, page, notes, asset, size, digest, running, stage, done, total}` |
+| POST | `/api/update/check` | проверить последний релиз GitHub → статус обновления |
+| POST | `/api/update/start` | начать скачивание → статус; 409, если нет новой версии, файла релиза или сборка не умеет обновляться (`source` тоже) |
+| POST | `/api/donate/rare` | `{ok: true}`; общий `donate: {next, rare}` в settings.json, напоминания через 7 дней, после выбора — 30 |
+| POST | `/api/link` | `{name}` → `{ok: true}`; только имена из `LINKS`: github, releases, monobank, kofi, crypto; неизвестное имя — 400 |
 | GET | `/api/dir?rel=` | `lib.list_dir(rel)`; нет в кеше → `{"rel": rel, "missing": true}` (страница сразу просит `fresh`); `pending` — сколько файлов папки ещё ждут чтения длительности/размеров (страница опрашивает кеш раз в 1,5 с, пока > 0: `metaWatch()`) |
 | GET | `/api/dir?rel=&fresh=1` | `lib.refresh_dir(rel)`, затем `list_dir`; плюс поле `"changed": bool`; `lib.prioritize(rel)` |
 | GET | `/api/tree?rel=` | `{"rel", "dirs": lib.subdirs(rel)}` |
@@ -227,6 +234,11 @@ def make_server(port: int, ctx) -> Server       # ctx — объект App из 
 ---
 
 ## app.py
+
+- `update.configure(read_all, write_all, SLOCK, app.prepare_restart)` связывает обновления с настройками без циклических импортов.
+  `prepare_restart()` сохраняет текущую папку, закрывает `Library` (в том числе индексацию) и возвращает аргументы нового запуска.
+- `fix_env()` вызывается до запуска дочерних процессов; `cleanup_old()` в фоне при старте удаляет остатки exe/app после обновления.
+  Самообновление проверяет размер, MZ/PK/ELF и sha256 из GitHub `digest`; исходники пакета обновляются вручную со страницы релизов.
 
 - `main()`: разбор параметров (`argparse`): `folder` (необязательный), `--port N` (0 — свободный), `--browser`, `--no-browser`.
 - `setup_log()`: журнал в `<app_dir>/vomedia.log` (+ консоль, если есть); `die(msg)` — в Windows без консоли `MessageBoxW`, как в VSPO.
@@ -295,8 +307,8 @@ Name — естественная (`localeCompare(…, {numeric: true, sensitivi
 Переход с видео: `pause()`, `removeAttribute('src')`, `load()` — освободить соединение.
 
 Колёсико мыши над картинкой — следующий/предыдущий файл. Двойной клик — полный экран.
-Одиночный клик по картинке/видео (не в полноэкранном режиме) — закрыть просмотрщик; ждать ~250 мс, чтобы не спутать с двойным.
-В полноэкранном режиме клик по видео — play/pause, по фото — ничего. Клики по панели и кнопкам просмотрщик не закрывают.
+Одиночный клик (ждать ~250 мс, чтобы не спутать с двойным): по видео — play/pause (и в полноэкранном режиме, и нет), по фото — закрыть
+просмотрщик (в полноэкранном режиме — ничего). Клики по панели и кнопкам просмотрщик не закрывают.
 
 **Переход между папками**: → на последнем файле — первый файл следующей папки (`/api/neighbor?step=1`), ← на первом — последний файл
 предыдущей (`step=-1`). Папка открывается как обычно (кеш, потом `fresh=1`), сетка под просмотрщиком тоже переходит в неё,

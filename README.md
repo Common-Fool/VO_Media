@@ -33,7 +33,27 @@ Synology share over SMB: a local SQLite cache and thumbnails keep browsing respo
 > [!NOTE]
 > MKV and MP4 files with audio/video codecs unsupported by the built-in browser player (such as AC3/DTS audio or HEVC/H.265 video) may not play directly. Use **Play in external player** from the context menu or error screen to open them in an external media player.
 
-## Requirements
+## Download
+
+Ready builds are on the [releases page](https://github.com/Common-Fool/VO_Media/releases/latest).
+
+| System | File | Notes |
+|---|---|---|
+| Windows 10/11 | `VO_Media.exe` | Single file, just run it. The exe is not code-signed; on the first start SmartScreen may ask you to choose **More info** → **Run anyway**. |
+| macOS 11+ (Apple Silicon) | `VO_Media-mac.zip` | Unpack and move `VO_Media.app` to Applications. The app is not signed by Apple: right-click → **Open** → **Open**, or run `xattr -cr /Applications/VO_Media.app` once. |
+| Linux x86-64 | `VO_Media-x86_64.AppImage` | `chmod +x VO_Media-x86_64.AppImage` and run it. Opens the library in your browser. |
+
+## Updates
+
+Open **☰ → Check for updates**. A green dot on the menu button and **Update to vX.Y** mean a new release is available.
+**Update and restart** downloads the build from GitHub, checks its size, file signature and SHA-256 when GitHub provides it,
+replaces the program and restarts VO Media with the current folder and launch options. Pending settings are saved and
+indexing is stopped before restarting. Release notes and the **Release page** button are in the same window.
+
+Source installations and unrecognized builds show a link to the release page instead of installing an update.
+Update the source package manually; the updater never replaces individual Python modules.
+
+## Requirements (running from source)
 
 - Python 3.8+. Windows 10/11 is the main target; macOS and Linux should work too.
 - Standard library only. Optional: `pip install pywebview` for a native window (without it the app opens in your browser).
@@ -113,3 +133,30 @@ Viewer:
 - Videos: `.mp4 .m4v .mkv .webm .gif` (GIF is treated as video)
 
 Other files are not shown.
+
+## Building
+
+GitHub Actions builds `VO_Media.exe`, `VO_Media-mac.zip` and `VO_Media-x86_64.AppImage` on every push
+(workflow **Build**, also runnable by hand). Download them from the run's **Artifacts**.
+Pushing a tag such as `v0.3`, or running the workflow with that tag in the **release** field, also publishes all three
+files as a GitHub release. The tag must equal `v` + `VERSION` in `vomedia/__init__.py`; the release job checks this.
+
+For a local Windows build:
+
+```bat
+pip install pyinstaller pywebview
+pyinstaller --onefile --noconsole --name VO_Media --icon assets/vomedia.ico --add-data "vomedia/web;vomedia/web" --collect-all webview --collect-all pythonnet --collect-all clr_loader vomedia.py
+```
+
+The result is `dist\VO_Media.exe`. The page is bundled from `vomedia/web`. macOS and Linux commands are in
+[`.github/workflows/build.yml`](.github/workflows/build.yml); Linux uses an onedir build without pywebview, packed as an AppImage.
+The workflow uses Python 3.12 and the existing icons in `assets/`; it does not use `VO Media.spec`.
+
+## Support
+
+VO Media is free and open source. If it saves you time, you can support its development from the **Support** button
+or **☰ → Support the project**, or use these links:
+
+- [Monobank jar](https://send.monobank.ua/jar/6m4nBQCW9B) (card of any bank)
+- [Ko-fi](https://ko-fi.com/commonfool)
+- [Crypto (NOWPayments)](https://nowpayments.io/donation/commonfool)

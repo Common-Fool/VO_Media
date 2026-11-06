@@ -1037,20 +1037,17 @@ function initViewer() {
   });
   addEventListener('pagehide', () => { if (V.open) { vWatch(); vProgress(true); } });
 
-  // клик по картинке: закрыть (ждём 250 мс — вдруг двойной); в полном экране видео — play/pause, фото — ничего
+  // одиночный клик (ждём 250 мс — вдруг двойной): видео — play/pause; фото — закрыть (в полном экране — ничего)
   const stage = $('#vstage');
   stage.addEventListener('click', e => {
     if (e.target.closest('button')) return;
     clearTimeout(V.clickT);
     if (e.target.closest('#vfallback')) return;
     if (vPhoto() && (VP.z > 1 || VP.moved)) { VP.moved = false; return; }
-    if (fsOn) {
-      const f = V.list[V.i];
-      if (vVideo(f)) vToggle();
-      return;
-    }
     if (e.detail > 1) return;                     // вторая половина двойного клика
-    V.clickT = setTimeout(closeViewer, 250);
+    const f = V.list[V.i];
+    if (vVideo(f) && !V.bad) { V.clickT = setTimeout(vToggle, 250); return; }
+    if (!fsOn) V.clickT = setTimeout(closeViewer, 250);
   });
   stage.addEventListener('dblclick', e => {
     if (e.target.closest('button')) return;

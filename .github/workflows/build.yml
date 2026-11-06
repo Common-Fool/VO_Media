@@ -1,0 +1,153 @@
+name: Build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release tag (e.g. v0.3); empty — build only'
+        required: false
+        default: ''
+
+permissions:
+  contents: read  # сборкам хватает чтения; запись — только у этапа release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'  # pythonnet (нужен pywebview) отстаёт с поддержкой самых новых версий
+
+      - name: Install PyInstaller and pywebview
+        run: python -m pip install --upgrade pip pyinstaller pywebview
+
+      - name: Check syntax
+        run: python -c "import glob, py_compile; [py_compile.compile(p, doraise=True) for p in ['vomedia.py'] + glob.glob('vomedia/*.py')]"
+
+      - name: Build VO_Media.exe
+        run: >
+          pyinstaller --onefile --noconsole --name VO_Media --icon assets/vomedia.ico
+          --add-data "vomedia/web;vomedia/web"
+          --collect-all webview --collect-all pythonnet --collect-all clr_loader vomedia.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: VO_Media-windows
+          path: dist/VO_Media.exe
+
+  macos:
+    runs-on: macos-latest  # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller, pywebview and Pillow (Pillow makes .icns from the PNG icon)
+        run: python -m pip install --upgrade pip pyinstaller pywebview pillow
+
+      - name: Build VO_Media.app
+        run: >
+          pyinstaller --windowed --name VO_Media --icon assets/vomedia.png
+          --osx-bundle-identifier io.github.common-fool.vo-media
+          --add-data "vomedia/web:vomedia/web" --collect-all webview vomedia.py
+
+      - name: Pack VO_Media-mac.zip
+        # ditto сохраняет права и символические ссылки внутри .app (обычный zip их теряет)
+        run: ditto -c -k --keepParent dist/VO_Media.app VO_Media-mac.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: VO_Media-macos
+          path: VO_Media-mac.zip
+
+  linux:
+    runs-on: ubuntu-22.04  # старая glibc: AppImage запустится и на дистрибутивах постарше
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install Tk (folder dialog in the browser mode) and PyInstaller
+        run: |
+          sudo apt-get update && sudo apt-get install -y tk
+          python -m pip install --upgrade pip pyinstaller
+          python -c "import tkinter" || echo "::warning::no tkinter: the folder dialog will not work in the AppImage"
+
+      # без pywebview: WebKitGTK внутрь AppImage толком не упаковывается, AppImage открывает галерею в браузере
+      - name: Build
+        run: pyinstaller --onedir --name VO_Media --add-data "vomedia/web:vomedia/web" vomedia.py
+
+      - name: Pack VO_Media-x86_64.AppImage
+        run: |
+          mkdir -p AppDir/usr/lib
+          cp -r dist/VO_Media AppDir/usr/lib/vomedia
+          printf '#!/bin/sh\nHERE="$(dirname "$(readlink -f "$0")")"\nexec "$HERE/usr/lib/vomedia/VO_Media" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          printf '[Desktop Entry]\nType=Application\nName=VO Media\nComment=Photo and video library viewer\nExec=VO_Media\nIcon=vomedia\nCategories=AudioVideo;Video;\nTerminal=false\n' > AppDir/vomedia.desktop
+          cp assets/vomedia.png AppDir/vomedia.png
+          cp assets/vomedia.png AppDir/.DirIcon
+          wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage" | sha256sum -c -
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir VO_Media-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: VO_Media-linux
+          path: VO_Media-x86_64.AppImage
+
+  release:
+    needs: [windows, macos, linux]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # создать релиз и выложить в него сборки
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # вся история и теги: для списка изменений с прошлого релиза
+
+      - name: Check that the release tag matches VERSION
+        env:
+          tag: ${{ inputs.release || github.ref_name }}
+        run: |
+          ver=$(python3 -c "import re; print(re.search(r\"^VERSION = '([^']+)'\", open('vomedia/__init__.py', encoding='utf-8').read(), re.M).group(1))")
+          if [ "$tag" != "v$ver" ]; then echo "Tag $tag does not match VERSION = '$ver' in vomedia/__init__.py"; exit 1; fi
+
+      - name: Release notes from commits since the previous tag
+        # в main пушат напрямую, без PR: автоматический текст GitHub из PR был бы пустым
+        env:
+          tag: ${{ inputs.release || github.ref_name }}
+        run: |
+          prev=$(git tag --list 'v*' --sort=-v:refname | grep -vx "$tag" | head -1)
+          {
+            echo "## Changes"
+            git log --no-merges --format='- %s' ${prev:+$prev..}HEAD
+          } > notes.md
+          cat notes.md
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: VO Media ${{ inputs.release || github.ref_name }}
+          body_path: notes.md  # текст релиза показывает встроенное обновление (☰ → Update)
+          generate_release_notes: true  # добавит ссылку на полный список изменений
+          files: |
+            dist/VO_Media-windows/VO_Media.exe
+            dist/VO_Media-macos/VO_Media-mac.zip
+            dist/VO_Media-linux/VO_Media-x86_64.AppImage

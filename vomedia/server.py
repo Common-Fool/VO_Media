@@ -17,7 +17,7 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import APP, VERSION, files
+from . import APP, VERSION, files, update
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ STATIC = {
     'viewer.js': 'application/javascript; charset=utf-8',
     'ui.js': 'application/javascript; charset=utf-8',
     'app.css': 'text/css; charset=utf-8',
+    'update.css': 'text/css; charset=utf-8',
     'grid.css': 'text/css; charset=utf-8',
     'viewer.css': 'text/css; charset=utf-8',
 }
@@ -314,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.route_get(p, q)
         except (ConnectionError, socket.timeout):  # браузер оборвал запрос (перемотка видео, уход со страницы)
             self.close_connection = True
-        except Fail as e:
+        except (Fail, update.UpdateError) as e:
             self.safe_reply(e.code, {'error': str(e)})
         except BadRange:
             self.close_connection = True
@@ -362,6 +363,14 @@ class Handler(BaseHTTPRequestHandler):
             if p[1] not in STATIC:
                 raise Fail('not found', 404)
             return self.reply(200, read_web(p[1]), STATIC[p[1]], cache='no-cache')
+        if p == ['api', 'app']:
+            with update.ULOCK:
+                first = not update.UPD['checked'] and not update.UPD['checking']
+            if first:
+                update.check_update(background=True)
+            return self.reply(200, {'update': update.update_status(), 'donate': update.donate_due()})
+        if p == ['api', 'update']:
+            return self.reply(200, update.update_status())
         if p == ['api', 'dir']:
             rel = clean_rel(qv('rel'))
             fresh = qv('fresh') in ('1', 'true')
@@ -537,6 +546,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self, p, raw):
         ctx = self.server.ctx
+        if p == ['api', 'update', 'check']:
+            update.check_update()
+            return self.reply(200, update.update_status())
+        if p == ['api', 'update', 'start']:
+            update.update_start()
+            return self.reply(200, update.update_status())
+        if p == ['api', 'donate', 'rare']:
+            update.donate_rare()
+            return self.reply(200, {'ok': True})
+        if p == ['api', 'link']:
+            return self.reply(200, update.open_link(self.jbody(raw).get('name')))
         if files.handles(p):
             return self.files_route(True, p, {}, raw)
         if len(p) == 3 and p[:2] == ['api', 'thumb']:

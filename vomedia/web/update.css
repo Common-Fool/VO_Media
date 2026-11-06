@@ -1,0 +1,29 @@
+/* Обновления и поддержка: стили VO SP; app.css не меняется. */
+#donb{color:#ff9db8;border-color:#5a3346;background:#2a1d26}
+#donb:hover{background:#38222f;border-color:#7a3f5c}
+#menub{position:relative;padding:5px 9px}
+#menub.upd::after{content:'';position:absolute;right:3px;top:3px;width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 2px var(--panel)}
+
+#menup button{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;text-align:left;background:none;border:0;border-radius:7px}
+#menup button:hover{background:var(--ctlh)}
+#menup button svg{width:16px;height:16px;flex:none;color:var(--dim)}
+#menup hr{margin:5px 6px;border:0;border-top:1px solid var(--line)}
+
+#mupd .badge{margin-left:auto;padding:1px 8px;border-radius:20px;background:#173c2d;color:var(--ok);font-size:12px;font-weight:600}
+.sheet h2{margin:0 0 8px;font-size:18px}
+.sheet p{margin:0 0 14px;line-height:1.55}
+#donp{width:min(620px,calc(100vw - 32px))}
+.don{display:flex;gap:20px;align-items:stretch;margin-bottom:18px}
+.dl{flex:1;display:flex;flex-direction:column;gap:8px}
+.dl button{display:flex;align-items:center;gap:12px;padding:10px 14px;text-align:left;border-radius:10px}
+.dl button b{display:block}
+.dl button span span{font-size:12px;color:var(--dim)}
+.dl .ic{display:flex;align-items:center;justify-content:center;width:34px;height:34px;flex:none;border-radius:9px;font-weight:700;color:#fff}
+.qr{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
+.qr svg{width:160px;height:160px;border-radius:10px;display:block}
+@media (max-width:560px){.don{flex-direction:column}}
+#updn{max-height:200px;overflow:auto;margin:0 0 14px;padding:10px 12px;border-radius:8px;background:#121318;font-size:13px;white-space:pre-wrap}
+
+.bar{height:6px;margin-bottom:4px;border-radius:3px;background:#262a35;overflow:hidden}
+.bar i{display:block;width:0;height:100%;background:var(--accg);transition:width .3s}
+#mupdt{display:flex;align-items:center;gap:10px;flex:1}

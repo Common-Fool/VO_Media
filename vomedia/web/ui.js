@@ -347,7 +347,7 @@ function syncControls() {
   $('#rootn').textContent = rootName;
   syncModeUi();
   $('#rootb').title = BOOT.root || '';
-  $('#mver').textContent = (BOOT.app || 'VO Media') + ' ' + (BOOT.version || '');
+  $('#mver').textContent = (BOOT.app || 'VO Media') + ' v' + (BOOT.version || '');
 }
 
 function wireControls() {
@@ -437,7 +437,7 @@ function wireControls() {
   $('#menub').onclick = () => togglePanel('menup');
   $('#rootb').onclick = () => togglePanel('rootp');
   $('#rpick').onclick = () => switchRoot('/api/root/pick', {});
-  $('#mupd').onclick = () => { closePanels(); indexCmd('/api/index/start', {full: false}, 'Updating the library…'); };
+  $('#mlib').onclick = () => { closePanels(); indexCmd('/api/index/start', {full: false}, 'Updating the library…'); };
   $('#mfull').onclick = async () => {
     closePanels();
     if (await ask('A full rescan rereads every folder of the library from the disk. On a big library on a network drive it can take a long time. Start it?', 'Start')) {
@@ -563,12 +563,96 @@ document.addEventListener('keydown', e => {
 });
 addEventListener('pagehide', () => { flushS(); });
 
+let upd = {version: BOOT.version};
+let updTimer = 0;
+const appApi = (path, isPost, body) => isPost ? post(path, body) : getJson(q(path));
+
+function initAppControls() {
+  const link = name => appApi('/api/link', true, {name}).catch(e => toast('Not opened: ' + e.message, true));
+  $('#mgh').onclick = () => { $('#menup').hidden = true; link('github'); };
+
+  function donate(reminder) {
+    $('#drare').hidden = !reminder;
+    sheet('donp');
+  }
+  $('#donb').onclick = () => donate(false);
+  $('#mdon').onclick = () => donate(false);
+  $('#dclose').onclick = closeSheet;
+  $('#drare').onclick = () => { appApi('/api/donate/rare', true).catch(() => {}); closeSheet(); };
+  $('#donp .dl').onclick = e => {
+    const b = e.target.closest('button[data-link]');
+    if (b) link(b.dataset.link);
+  };
+
+  function updStat() {
+    $('#mver').textContent = 'VO Media v' + upd.version;
+    $('#menub').classList.toggle('upd', !!upd.newer);
+    $('#mupdt').innerHTML = upd.newer ? 'Update to ' + esc(upd.latest) + '<span class="badge">new</span>' : 'Check for updates';
+    if ($('#updp').hidden) return;
+    const pct = upd.total ? Math.round(100 * upd.done / upd.total) : 0;
+    $('#updh').textContent = upd.newer ? 'VO Media ' + upd.latest + ' is available' : 'Updates';
+    $('#updt').textContent = upd.running
+      ? (upd.stage === 'downloading' ? 'Downloading… ' + pct + '%' + (upd.total ? ' of ' + fmtSize(upd.total) : '')
+        : upd.stage === 'installing' ? 'Installing…' : 'Restarting VO Media…')
+      : upd.checking ? 'Checking GitHub…'
+      : upd.error ? 'Update failed: ' + upd.error
+      : upd.newer && (!upd.kind || upd.kind === 'source') ? 'You have v' + upd.version + '. This build cannot update itself: download the new version from the release page.'
+      : upd.newer ? 'You have v' + upd.version + '. The new version will be downloaded from GitHub, then VO Media restarts with the same folder.'
+      : upd.latest ? 'You have the latest version, v' + upd.version + '.' : 'You have v' + upd.version + '.';
+    $('#updn').textContent = upd.notes || '';
+    $('#updn').hidden = !upd.newer || !upd.notes || upd.running;
+    $('#updbar').hidden = !upd.running;
+    $('#updi').style.width = (upd.stage === 'downloading' ? pct : 100) + '%';
+    $('#updgo').hidden = !upd.newer || upd.running || !upd.kind || upd.kind === 'source';
+    $('#updnotes').hidden = !upd.newer || upd.running;
+    $('#updclose').hidden = upd.running;
+  }
+  async function updTick() {
+    updTimer = 0;
+    try { upd = await appApi('/api/update'); } catch (_) {
+      if (upd.stage === 'restarting') { $('#updt').textContent = 'VO Media has restarted in a new window. This one can be closed.'; return; }
+    }
+    updStat();
+    if (upd.running || upd.checking) updTimer = setTimeout(updTick, 500);
+  }
+  $('#mupd').onclick = async () => {
+    sheet('updp');
+    updStat();
+    if (upd.newer) return;
+    upd.checking = true;
+    updStat();
+    try { upd = await appApi('/api/update/check', true); } catch (e) { upd.checking = false; upd.error = e.message; }
+    updStat();
+    if (upd.checking && !updTimer) updTimer = setTimeout(updTick, 500);
+  };
+  $('#updclose').onclick = closeSheet;
+  $('#updnotes').onclick = () => link('releases');
+  $('#updgo').onclick = async () => {
+    try {
+      await flushS();
+      upd = await appApi('/api/update/start', true);
+    } catch (e) {
+      upd.error = e.message;
+    }
+    updStat();
+    if (upd.running && !updTimer) updTimer = setTimeout(updTick, 500);
+  };
+
+  appApi('/api/app').then(r => {
+    upd = r.update;
+    updStat();
+    if (upd.checking) updTimer = setTimeout(updTick, 1500);
+    if (r.donate) donate(true);
+  }).catch(() => {});
+}
+
 function init() {
   $scroll = $('#scroll'); $sizer = $('#sizer'); $cells = $('#cells');
   initViewer();
   syncControls();
   fillRecent();
   wireControls();
+  initAppControls();
   applyVol();
   const root = tnode('', null);
   root.name = rootName;

@@ -12,11 +12,12 @@ import logging
 import os
 import secrets
 import sys
+import subprocess
 import threading
 import time
 import webbrowser
 
-from . import APP, VERSION
+from . import APP, VERSION, update
 from .index import Library, app_dir, cache_dir
 from .server import make_server, root_name
 
@@ -72,6 +73,12 @@ def die(msg):
             import ctypes
             ctypes.windll.user32.MessageBoxW(0, str(msg), APP, 0x10)
         except Exception:  # noqa: BLE001
+            pass
+    elif update.mac_bundle():  # приложение из Finder: консоли тоже нет
+        text = str(msg).replace('\\', '\\\\').replace('"', '\\"')
+        try:
+            subprocess.run(['osascript', '-e', 'display alert "%s" message "%s" as critical' % (APP, text)], timeout=600)
+        except (OSError, subprocess.SubprocessError):
             pass
     sys.exit(1)
 
@@ -212,6 +219,8 @@ class App:
         self._lib = self._open(path)
         self._root = path
         self._remember(path)
+        self.restart_options = []
+        update.configure(read_all, write_all, SLOCK, self.prepare_restart)
         self._lib.start_index(False)      # пустую БД Library сама обходит полностью; окно обхода не ждёт
 
     # ───── библиотека ─────
@@ -244,6 +253,16 @@ class App:
             self._lib.close()
         except Exception:  # noqa: BLE001
             log.exception('closing the library failed')
+
+    def prepare_restart(self):
+        """Сохранить текущую папку и остановить библиотеку до запуска новой версии."""
+        with self._swlock:
+            with self._cv:
+                self._switching = True
+                self._cv.wait_for(lambda: self._active == 0)
+            self._remember(self._root)
+            self.close()
+            return [self._root] + self.restart_options
 
     def _open(self, path):
         lib = Library(path)
@@ -506,7 +525,9 @@ def run_window(url, title, ctx=None, width=1600, height=1000):
 # ───────────────────────── запуск ─────────────────────────
 
 def main():
+    update.fix_env()
     setup_log()
+    threading.Thread(target=update.cleanup_old, name='vomedia-update-cleanup', daemon=True).start()
     ap = argparse.ArgumentParser(description=APP + ': fast viewer for photos and videos in huge folders (NAS-friendly).')
     ap.add_argument('--version', action='version', version='%s %s' % (APP, VERSION))
     ap.add_argument('folder', nargs='?',
@@ -537,6 +558,11 @@ def main():
 
     try:
         app = App(path)
+        app.restart_options = ['--port', str(a.port)]
+        if a.browser:
+            app.restart_options.append('--browser')
+        if a.no_browser:
+            app.restart_options.append('--no-browser')
     except Exception as e:  # noqa: BLE001
         log.exception('could not open the library')
         die('Could not open %s: %s' % (path, e))
